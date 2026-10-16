@@ -1,12 +1,13 @@
 package com.database.atypon.Node.controllers.index;
 
 import com.database.atypon.Node.index.BPlusTree;
-import com.database.atypon.Node.model.Network;
 import com.database.atypon.Node.model.Node;
 import com.database.atypon.Node.security.SecurityUtils;
 import com.database.atypon.Node.services.index.IndexManager;
+import com.database.atypon.Node.utils.Forwarder;
 import com.database.atypon.Node.utils.response.Response;
 import com.database.atypon.Node.utils.response.ResponseType;
+import com.database.atypon.Node.utils.ring.RingRouter;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.HashMap;
@@ -29,6 +30,11 @@ public class IndexController {
     @PostMapping(value = "/admin/index/create", produces = "application/json")
     public Vector<Response> createIndex(@RequestParam String database, @RequestParam String schema,
                                         @RequestParam String field) {
+        // a client request goes to the schema's primary, which builds the index and copies it to the replicas
+        if (isAdminOrigin() && !RingRouter.isPrimary(database, schema)) {
+            return Forwarder.forwardForResponses(RingRouter.primaryFor(database, schema),
+                    "/admin/index/create?database=" + database + "&schema=" + schema + "&field=" + field, null);
+        }
         Vector<Response> responses = new Vector<>();
         try {
             indexManager.createIndex(database, schema, field);
@@ -39,7 +45,7 @@ public class IndexController {
         if (!isAdminOrigin()) {
             return responses;
         }
-        for (Node node : Network.nodes) {
+        for (Node node : replicaTargets(database, schema)) {
             responses.add(node.createIndex(database, schema, field));
         }
         return responses;
@@ -48,6 +54,11 @@ public class IndexController {
     @PostMapping(value = "/admin/index/drop", produces = "application/json")
     public Vector<Response> dropIndex(@RequestParam String database, @RequestParam String schema,
                                       @RequestParam String field) {
+        // a client request goes to the schema's primary, which drops the index and copies that to the replicas
+        if (isAdminOrigin() && !RingRouter.isPrimary(database, schema)) {
+            return Forwarder.forwardForResponses(RingRouter.primaryFor(database, schema),
+                    "/admin/index/drop?database=" + database + "&schema=" + schema + "&field=" + field, null);
+        }
         Vector<Response> responses = new Vector<>();
         try {
             indexManager.dropIndex(database, schema, field);
@@ -58,7 +69,7 @@ public class IndexController {
         if (!isAdminOrigin()) {
             return responses;
         }
-        for (Node node : Network.nodes) {
+        for (Node node : replicaTargets(database, schema)) {
             responses.add(node.dropIndex(database, schema, field));
         }
         return responses;
@@ -84,6 +95,11 @@ public class IndexController {
             if (database == null || schema == null || field == null || opRaw == null) {
                 return new Response(ResponseType.ERROR, "Missing required field (database, schema, field, op)");
             }
+            // a node that holds no copy of the schema hands the query to one that does
+            if (!RingRouter.isReplica(database, schema)) {
+                return Forwarder.forwardForResponse(RingRouter.primaryFor(database, schema),
+                        "/user/index/query", body, true);
+            }
             BPlusTree.Op op = BPlusTree.Op.valueOf(opRaw.toString().toUpperCase());
             Object value = body.get("value");
             Object high = body.get("high");
@@ -97,6 +113,14 @@ public class IndexController {
         } catch (Exception e) {
             return new Response(ResponseType.ERROR, e.getMessage());
         }
+    }
+
+    /**
+     * The peers an index build or drop must be copied to: the schema's other replicas on the ring, not
+     * every node in the cluster. Empty on a single node.
+     */
+    List<Node> replicaTargets(String database, String schema) {
+        return RingRouter.otherReplicas(database, schema);
     }
 
     private Vector<Response> one(Response r) {
