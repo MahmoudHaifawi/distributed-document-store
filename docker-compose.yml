@@ -1,34 +1,59 @@
-# One image, launched five times by role. Build once:  docker compose up --build
+# One image, launched seven times by role. Build once:  docker compose up --build
 # Open http://localhost:8078/login   (seeded admin: mahmoud / admin)
 #
 # Every service runs the same image (built once from the root Dockerfile) and differs only by its
 # SPRING_PROFILES_ACTIVE role. Addressing is by compose service name: the coordinator is told the
 # data-node list via CLUSTER_NODES, and the gateway finds the coordinator via BOOTSTRAP_URL. Node
 # service names are capitalised (Node0..) to match the schema-affinity names the nodes assign.
+#
+# Sharding (M6): the five data nodes form a consistent-hash ring (VNODES_PER_NODE virtual nodes each,
+# default 150). Every schema is placed on REPLICATION_FACTOR of the five nodes, so with RF=3 each schema
+# lives on 3 of 5. Each node builds the ring from the cluster membership (the coordinator wires the mesh
+# from CLUSTER_NODES), so CLUSTER_NODES and REPLICATION_FACTOR are set identically on the coordinator
+# and on every node via the shared x-cluster-env block below.
+x-cluster-env: &cluster-env
+  CLUSTER_NODES: "Node0:8080,Node1:8080,Node2:8080,Node3:8080,Node4:8080"
+  REPLICATION_FACTOR: "3"
+
 services:
   Node0:
     image: nosql-db:latest
     build: .
     environment:
+      <<: *cluster-env
       SPRING_PROFILES_ACTIVE: node
     networks: [db_cluster]
   Node1:
     image: nosql-db:latest
     environment:
+      <<: *cluster-env
       SPRING_PROFILES_ACTIVE: node
     networks: [db_cluster]
   Node2:
     image: nosql-db:latest
     environment:
+      <<: *cluster-env
+      SPRING_PROFILES_ACTIVE: node
+    networks: [db_cluster]
+  Node3:
+    image: nosql-db:latest
+    environment:
+      <<: *cluster-env
+      SPRING_PROFILES_ACTIVE: node
+    networks: [db_cluster]
+  Node4:
+    image: nosql-db:latest
+    environment:
+      <<: *cluster-env
       SPRING_PROFILES_ACTIVE: node
     networks: [db_cluster]
 
   bootstrappingnode:
     image: nosql-db:latest
     environment:
+      <<: *cluster-env
       SPRING_PROFILES_ACTIVE: coordinator
-      CLUSTER_NODES: "Node0:8080,Node1:8080,Node2:8080"
-    depends_on: [Node0, Node1, Node2]
+    depends_on: [Node0, Node1, Node2, Node3, Node4]
     networks: [db_cluster]
 
   dbms:
