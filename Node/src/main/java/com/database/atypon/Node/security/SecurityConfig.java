@@ -25,7 +25,9 @@ public class SecurityConfig {
                 .authorizeRequests()
                 .antMatchers("/login", "/health").permitAll()
                 .antMatchers("/network/**").hasRole("INTERNAL")
-                .antMatchers("/write/document/repair").hasRole("INTERNAL")
+                // mvcMatchers, unlike antMatchers, matches the URL variants Spring MVC serves for this handler
+                // (such as a trailing slash); the handler also checks the role itself
+                .mvcMatchers("/write/document/repair").hasRole("INTERNAL")
                 .antMatchers("/admin/**").hasRole("ADMIN")
                 .antMatchers("/user/**", "/write/**").hasRole("USER")
                 .anyRequest().authenticated()

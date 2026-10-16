@@ -31,10 +31,38 @@ class WriteControllerRepairTest {
         SecurityContextHolder.clearContext();
     }
 
+    private static void authenticateAs(String role) {
+        SecurityContextHolder.getContext().setAuthentication(
+                new UsernamePasswordAuthenticationToken("caller", "token", JwtService.authorities(role)));
+    }
+
+    @Test
+    void repairRefusesAnyCallerThatIsNotInternalWhateverTheUrlRulesLetThrough() {
+        // the URL rule is only the first guard (it misses a trailing slash), so the handler checks the role too
+        for (String role : new String[]{"USER", "ADMIN"}) {
+            authenticateAs(role);
+            HashMap<String, Object> winner = new HashMap<>();
+            winner.put("_version", 3);
+
+            Vector<Response> out = controller.repairDocument("db", "s", "0", winner);
+
+            assertThat(out).hasSize(1);
+            assertThat(out.get(0).getResponseType()).as(role).isEqualTo(ResponseType.ERROR);
+        }
+        verify(writeService, never()).repairDocument(any(), any(), any(), any());
+    }
+
+    @Test
+    void repairRefusesAnUnauthenticatedCaller() {
+        Vector<Response> out = controller.repairDocument("db", "s", "0", new HashMap<>());
+
+        assertThat(out.get(0).getResponseType()).isEqualTo(ResponseType.ERROR);
+        verify(writeService, never()).repairDocument(any(), any(), any(), any());
+    }
+
     @Test
     void repairAppliesTheWinnerConditionallyAndNeverRunsAnOriginWrite() {
-        SecurityContextHolder.getContext().setAuthentication(
-                new UsernamePasswordAuthenticationToken("node", "token", JwtService.authorities("INTERNAL")));
+        authenticateAs("INTERNAL");
         Response applied = new Response(ResponseType.SUCCESS, "Document repaired", true);
         when(writeService.repairDocument(eq("db"), eq("s"), eq("0"), any())).thenReturn(applied);
         HashMap<String, Object> winner = new HashMap<>();

@@ -323,6 +323,35 @@ class ReadRepairIntegrationTest {
         assertThat(new JSONObject(Files.readString(localDocument())).getInt("_version")).isEqualTo(1);
     }
 
+    @Test
+    void aClientCannotReachTheRepairEndpointThroughATrailingSlash() throws IOException {
+        // Spring MVC serves "/write/document/repair/" as the same handler, but an ant URL rule for
+        // "/write/document/repair" does not match it. The URL rule is therefore an MVC matcher, and the
+        // handler refuses a non-internal caller on its own too (see WriteControllerRepairTest)
+        writeLocal(doc(1, 1));
+
+        ResponseEntity<String> response = post(
+                "/write/document/repair/?database=" + DB + "&schema=" + schema + "&id=" + ID,
+                "Bearer " + jwtService.generateToken("alice", "USER", Duration.ofMinutes(5)), doc(9, 3));
+
+        assertThat(response.getStatusCode().value()).isEqualTo(403);
+        JSONObject stored = new JSONObject(Files.readString(localDocument()));
+        assertThat(stored.getInt("_version")).isEqualTo(1);   // the client's payload was not applied
+        assertThat(stored.getInt("n")).isEqualTo(1);
+    }
+
+    @Test
+    void theInternalRepairStillWorksThroughATrailingSlash() throws IOException {
+        writeLocal(doc(1, 1));
+
+        ResponseEntity<String> response = post(
+                "/write/document/repair/?database=" + DB + "&schema=" + schema + "&id=" + ID,
+                serviceBearer(), doc(9, 3));
+
+        assertThat(response.getStatusCode().value()).isEqualTo(200);
+        assertThat(new JSONObject(Files.readString(localDocument())).getInt("_version")).isEqualTo(3);
+    }
+
     private void repairAsInternal(String winner) {
         ResponseEntity<String> response = post(
                 "/write/document/repair?database=" + DB + "&schema=" + schema + "&id=" + ID, serviceBearer(), winner);
