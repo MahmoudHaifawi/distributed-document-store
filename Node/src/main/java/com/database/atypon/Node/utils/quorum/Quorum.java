@@ -39,4 +39,22 @@ public final class Quorum {
         }
         return acks;
     }
+
+    /**
+     * What the client is told for a write that this node applied and copied to its replicas. A failed
+     * local apply is controlling and is returned as is. Otherwise the write is acknowledged only when at
+     * least {@code w} replicas (this node included) persisted it; if not, the client gets an ERROR saying
+     * the write quorum was not met, even though the local apply itself succeeded.
+     */
+    public static Response writeClientResult(boolean localSuccess, Response localResult,
+                                             List<Response> replicaResponses, int w) {
+        if (!localSuccess) {
+            return localResult;
+        }
+        int acks = ackCount(true, replicaResponses);
+        if (acks >= w) {
+            return localResult;
+        }
+        return new Response(ResponseType.ERROR, "write quorum not met (" + acks + "/" + w + ")");
+    }
 }

@@ -6,6 +6,8 @@ import com.database.atypon.Node.services.write.WriteService;
 import com.database.atypon.Node.utils.AffinityLoadBalancer;
 import com.database.atypon.Node.utils.Forwarder;
 import com.database.atypon.Node.utils.JsonKeys;
+import com.database.atypon.Node.utils.quorum.ConsistencyConfig;
+import com.database.atypon.Node.utils.quorum.Quorum;
 import com.database.atypon.Node.utils.response.Response;
 import com.database.atypon.Node.utils.response.ResponseType;
 import com.database.atypon.Node.utils.ring.RingRouter;
@@ -48,15 +50,13 @@ public class WriteController {
                         "/write/schema/new?database=" + database, schema);
         }
 
-        Vector<Response> responses = new Vector<>();
-        responses.add(writeService.createSchema(database, schema));
+        Response localResult = writeService.createSchema(database, schema);
 
         if(isInternal())
-            return responses;
+            return new Vector<>(List.of(localResult));
 
-        responses.addAll(writeService.broadcastSchema(database, schema));
-
-        return responses;
+        String schemaName = schema.get(JsonKeys.SCHEMA_NAME).toString();
+        return withWriteQuorum(database, schemaName, localResult, writeService.broadcastSchema(database, schema));
     }
 
     @PostMapping(value = "/document/new", produces = "application/json")
@@ -75,18 +75,17 @@ public class WriteController {
 
         //forward the request to another node if the node affinity is not the current node
         Response affinityResponse = AffinityLoadBalancer.checkAffinity(database, schema);
-        Vector<Response> responses = new Vector<>();
         if(affinityResponse.getResponseType() == ResponseType.ERROR){
             Node node = (Node) affinityResponse.getContent();
             return Forwarder.forwardForResponses(node,
                     "/write/document/new?database=" + database + "&schema=" + schema, document);
         }
-        responses.add(writeService.createDocument(database, schema, document));
+        Response localResult = writeService.createDocument(database, schema, document);
 
-        if(responses.get(0).getResponseType() == ResponseType.SUCCESS)
-            responses.addAll(writeService.broadcastDocument(database, schema, document));
-
-        return responses;
+        List<Response> replicaResponses = localResult.getResponseType() == ResponseType.SUCCESS
+                ? writeService.broadcastDocument(database, schema, document)
+                : List.of();
+        return withWriteQuorum(database, schema, localResult, replicaResponses);
     }
 
     @PostMapping(value = "/document/update", produces = "application/json")
@@ -106,16 +105,15 @@ public class WriteController {
         if (v instanceof Number)
             expectedVersion = ((Number) v).intValue();
 
-        Vector<Response> responses = new Vector<>();
         Response result = writeService.updateDocument(database, schema, id, document, expectedVersion);
-        responses.add(result);
 
+        List<Response> replicaResponses = List.of();
         if (result.getResponseType() == ResponseType.SUCCESS) {
             // stamp the new version onto the document and replicate it verbatim to peers
             document.put("_version", ((Number) result.getContent()).intValue());
-            responses.addAll(writeService.broadcastUpdate(database, schema, id, document));
+            replicaResponses = writeService.broadcastUpdate(database, schema, id, document);
         }
-        return responses;
+        return withWriteQuorum(database, schema, result, replicaResponses);
     }
 
     @PostMapping(value = "/document/delete", produces = "application/json")
@@ -131,11 +129,31 @@ public class WriteController {
                     "/write/document/delete?database=" + database + "&schema=" + schema + "&id=" + id
                             + "&version=" + version, null);
 
-        Vector<Response> responses = new Vector<>();
         Response result = writeService.deleteDocument(database, schema, id, version);
-        responses.add(result);
-        if (result.getResponseType() == ResponseType.SUCCESS) {
-            responses.addAll(writeService.broadcastDelete(database, schema, id));
+
+        List<Response> replicaResponses = result.getResponseType() == ResponseType.SUCCESS
+                ? writeService.broadcastDelete(database, schema, id)
+                : List.of();
+        return withWriteQuorum(database, schema, result, replicaResponses);
+    }
+
+    /**
+     * The answer to a client write this node applied and copied to the schema's other replicas: this
+     * node's own result first, then each replica's. When the local apply succeeded but fewer than W of the
+     * schema's N replicas (this node counted as one) persisted the write, the first response is replaced
+     * by an ERROR so the client is not told "done" for a write that has not reached a quorum. A failed
+     * local apply is left as it is. With a single replica, W is 1 and the local apply is the one ack.
+     */
+    private Vector<Response> withWriteQuorum(String database, String schema, Response localResult,
+                                             List<Response> replicaResponses) {
+        Vector<Response> responses = new Vector<>();
+        responses.add(localResult);
+        responses.addAll(replicaResponses);
+
+        if (localResult.getResponseType() == ResponseType.SUCCESS) {
+            int replicas = RingRouter.replicasFor(database, schema).size();
+            int w = Quorum.required(ConsistencyConfig.writeConsistency(), replicas);
+            responses.set(0, Quorum.writeClientResult(true, localResult, replicaResponses, w));
         }
         return responses;
     }
