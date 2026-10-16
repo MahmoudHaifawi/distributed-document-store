@@ -12,9 +12,16 @@
 # lives on 3 of 5. Each node builds the ring from the cluster membership (the coordinator wires the mesh
 # from CLUSTER_NODES), so CLUSTER_NODES and REPLICATION_FACTOR are set identically on the coordinator
 # and on every node via the shared x-cluster-env block below.
+#
+# Tunable consistency (M7): WRITE_CONSISTENCY / READ_CONSISTENCY (ONE | QUORUM | ALL) set how many of a
+# schema's replicas must acknowledge a write (W) and answer a read (R). With RF=3, QUORUM is 2 of 3, so
+# W + R = 4 > 3 gives read-your-writes, a write survives one replica being down, and a read repairs a
+# replica that missed an update (last-write-wins by version). Set identically on every node.
 x-cluster-env: &cluster-env
   CLUSTER_NODES: "Node0:8080,Node1:8080,Node2:8080,Node3:8080,Node4:8080"
   REPLICATION_FACTOR: "3"
+  WRITE_CONSISTENCY: "QUORUM"
+  READ_CONSISTENCY: "QUORUM"
 
 services:
   Node0:
