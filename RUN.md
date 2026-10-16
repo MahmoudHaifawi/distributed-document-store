@@ -40,9 +40,9 @@ query to a replica that holds the schema, so clients never need to know where da
 
 The compose demo runs 5 nodes with `REPLICATION_FACTOR=3`, so **each schema lives on 3 of the 5
 nodes** rather than on every node. To see it: sign in, create a database and several schemas, then read
-and query them from the dashboard. Every schema is served from its own subset of three nodes, so the
-databases and schemas listed under each container's `/app/data` differ from node to node, e.g.
-`docker compose exec Node0 ls /app/data/<database>`.
+and query them from the dashboard. Databases are created on every node, but each schema is served from
+its own subset of three nodes, so the schema directories under `/app/data/<database>` differ from node
+to node, e.g. `docker compose exec Node0 ls /app/data/<database>`.
 
 Two environment variables tune the ring (both optional):
 
@@ -51,10 +51,12 @@ Two environment variables tune the ring (both optional):
 | `REPLICATION_FACTOR` | `3`     | Number of nodes that hold a copy of each schema (clamped to cluster size) |
 | `VNODES_PER_NODE`    | `150`   | Virtual nodes each physical node places on the ring (smoother balance)    |
 
-Every node builds the ring from the cluster membership, so `CLUSTER_NODES` and `REPLICATION_FACTOR`
-must be identical on the coordinator and on every data node; `docker-compose.yml` sets them once in a
-shared `x-cluster-env` block. Changing either on a cluster that already holds data changes where
-schemas are placed and existing data is not rebalanced, so set them before creating data.
+Each node builds the ring from the cluster membership that the coordinator wires up from
+`CLUSTER_NODES` (only the coordinator reads that variable), so every node computes the same
+placement. `REPLICATION_FACTOR` and `VNODES_PER_NODE` are read by each node itself and must match on
+every node; `docker-compose.yml` sets them once in a shared `x-cluster-env` block. Changing either on a
+cluster that already holds data changes where schemas are placed and existing data is not rebalanced,
+so set them before creating data.
 
 > If the coordinator starts before the data nodes accept connections, its one-shot mesh wiring is
 > skipped. Re-run it once the nodes are up: `docker compose restart bootstrappingnode`.
@@ -83,14 +85,8 @@ The data node reads `./data/info.json` (the admin seed), so launch it from the `
 which holds that file. Defaults target a single local node (`CLUSTER_NODES=localhost:8080`,
 `BOOTSTRAP_URL=http://localhost:8079`), so no environment variables are needed.
 
-> A single node has no peers to shard across, so `REPLICATION_FACTOR` clamps to 1 and every schema
-> lives on that one node.
->
-> Single-node caveat: schema affinity assigns schemas to a node named `Node0`, which does not match
-> the local node's address (`localhost`). Database/schema creation and all index operations work, but
-> creating a **document** through the gateway UI would try to forward to `Node0`. Seed documents via
-> the node's own API (`POST /write/document/new` with a valid Bearer token) for the local demo, or use
-> the Docker cluster (where node names and affinity names align) to exercise document writes.
+> Single node: with no peers the ring places every schema on this one node (`REPLICATION_FACTOR`
+> clamps to 1), so all operations — including gateway document writes — work locally.
 
 ---
 

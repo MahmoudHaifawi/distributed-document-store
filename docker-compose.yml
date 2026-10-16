@@ -4,7 +4,8 @@
 # Every service runs the same image (built once from the root Dockerfile) and differs only by its
 # SPRING_PROFILES_ACTIVE role. Addressing is by compose service name: the coordinator is told the
 # data-node list via CLUSTER_NODES, and the gateway finds the coordinator via BOOTSTRAP_URL. Node
-# service names are capitalised (Node0..) to match the schema-affinity names the nodes assign.
+# service names are capitalised (Node0..) so they match the CLUSTER_NODES / mesh names the
+# consistent-hash ring is built from.
 #
 # Sharding (M6): the five data nodes form a consistent-hash ring (VNODES_PER_NODE virtual nodes each,
 # default 150). Every schema is placed on REPLICATION_FACTOR of the five nodes, so with RF=3 each schema
