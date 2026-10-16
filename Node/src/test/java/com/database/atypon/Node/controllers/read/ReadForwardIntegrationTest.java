@@ -190,6 +190,34 @@ class ReadForwardIntegrationTest {
     }
 
     @Test
+    void nonReplicaForwardsListIndexesToTheSchemasPrimary() {
+        String schema = schemaNotHeldHereWhosePrimaryIsTheStub();
+        String jwt = adminJwt();
+
+        ResponseEntity<String> response = get("/admin/index/list?database=" + DB + "&schema=" + schema, jwt);
+
+        assertThat(received).hasSize(1);
+        Received forwarded = received.get(0);
+        assertThat(forwarded.method()).isEqualTo("GET"); // a read stays a GET and carries no body
+        assertThat(forwarded.uri()).isEqualTo("/admin/index/list?database=" + DB + "&schema=" + schema);
+        assertThat(forwarded.auth()).isEqualTo("Bearer " + jwt);
+        assertThat(forwarded.body()).isEmpty();
+        // the client sees the replica's list, not an empty one from a node that holds no copy
+        assertThat(new JSONArray(response.getBody()).getJSONObject(0).getString("message")).isEqualTo("stub indexed");
+    }
+
+    @Test
+    void replicaServesListIndexesLocally() {
+        String schema = schemaHeldHere();
+
+        ResponseEntity<String> response = get("/admin/index/list?database=" + DB + "&schema=" + schema, adminJwt());
+
+        assertThat(received).isEmpty(); // served here, nothing handed to a peer
+        assertThat(new JSONArray(response.getBody()).getJSONObject(0).getString("message"))
+                .isNotEqualTo("stub indexed");
+    }
+
+    @Test
     void replicaServesReadsAndIndexQueriesLocally() {
         String schema = schemaHeldHere();
         String jwt = userJwt();

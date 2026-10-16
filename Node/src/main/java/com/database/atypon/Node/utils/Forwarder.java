@@ -33,12 +33,16 @@ public final class Forwarder {
      * parsing failure comes back as a single ERROR response rather than an exception.
      */
     public static Vector<Response> forwardForResponses(Node target, String pathWithQuery, Object body) {
-        try {
-            HttpHeaders headers = new HttpHeaders();
-            headers.set("Authorization", "Bearer " + SecurityUtils.currentToken());
-            HttpEntity<Object> request = body == null ? new HttpEntity<>(headers) : new HttpEntity<>(body, headers);
+        return forwardForResponses(target, pathWithQuery, body, true);
+    }
 
-            Vector<?> returned = REST.postForObject(target.getURL() + pathWithQuery, request, Vector.class);
+    /**
+     * As {@link #forwardForResponses(Node, String, Object)}, but a GET with no body when {@code post} is
+     * false, for the read endpoints that answer with a {@code Vector<Response>}.
+     */
+    public static Vector<Response> forwardForResponses(Node target, String pathWithQuery, Object body, boolean post) {
+        try {
+            Vector<?> returned = send(target, pathWithQuery, body, post, Vector.class);
             Vector<Response> responses = new Vector<>();
             if (returned != null) {
                 for (Object element : returned) {
@@ -61,12 +65,7 @@ public final class Forwarder {
      */
     public static Response forwardForResponse(Node target, String pathWithQuery, Object body, boolean post) {
         try {
-            HttpHeaders headers = new HttpHeaders();
-            headers.set("Authorization", "Bearer " + SecurityUtils.currentToken());
-            HttpEntity<Object> request = post && body != null ? new HttpEntity<>(body, headers) : new HttpEntity<>(headers);
-
-            Map<?, ?> returned = REST.exchange(target.getURL() + pathWithQuery,
-                    post ? HttpMethod.POST : HttpMethod.GET, request, Map.class).getBody();
+            Map<?, ?> returned = send(target, pathWithQuery, body, post, Map.class);
             if (returned == null) {
                 return new Response(ResponseType.ERROR, "Error forwarding request", "Empty response from " + target.getName());
             }
@@ -74,6 +73,15 @@ public final class Forwarder {
         } catch (Exception e) {
             return new Response(ResponseType.ERROR, "Error forwarding request", e.getMessage());
         }
+    }
+
+    /** One HTTP call to the target with the caller's own token: a POST carrying {@code body} (if any), or a bare GET. */
+    private static <T> T send(Node target, String pathWithQuery, Object body, boolean post, Class<T> responseType) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.set("Authorization", "Bearer " + SecurityUtils.currentToken());
+        HttpEntity<Object> request = post && body != null ? new HttpEntity<>(body, headers) : new HttpEntity<>(headers);
+        return REST.exchange(target.getURL() + pathWithQuery, post ? HttpMethod.POST : HttpMethod.GET,
+                request, responseType).getBody();
     }
 
     private static Response toResponse(Map<?, ?> json) {

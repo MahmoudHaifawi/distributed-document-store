@@ -77,6 +77,11 @@ public class IndexController {
 
     @GetMapping(value = "/admin/index/list", produces = "application/json")
     public Vector<Response> listIndexes(@RequestParam String database, @RequestParam String schema) {
+        // a node that holds no copy of the schema has no indexes for it; ask one that does
+        if (!RingRouter.isReplica(database, schema)) {
+            return Forwarder.forwardForResponses(RingRouter.primaryFor(database, schema),
+                    "/admin/index/list?database=" + database + "&schema=" + schema, null, false);
+        }
         try {
             List<String> fields = indexManager.listIndexes(database, schema);
             return one(new Response(ResponseType.SUCCESS, "Indexed fields", fields));
