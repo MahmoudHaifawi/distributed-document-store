@@ -20,7 +20,6 @@ public class AdminOperations {
         // 1. new directory for the database in the databases directory
         // 2. directory for the schemas inside the database directory
         // 3. new file for the database info inside the database directory
-        // 4. new directory for schemas affinities inside the database directory
         try {
             String pathToDatabase = PathBuilder.getPathToDatabase(databaseName);
             String pathToSchemas = PathBuilder.getPathToAllSchemas(databaseName);
@@ -28,11 +27,9 @@ public class AdminOperations {
             synchronized (this) {
                 DirectoryManager databaseDirectory = new DirectoryManager(new File(pathToDatabase));
                 DirectoryManager schemasDirectory = new DirectoryManager(new File(pathToSchemas));
-                DirectoryManager affinitiesDirectory = new DirectoryManager(new File(PathBuilder.getPathToAllAffinities(databaseName)));
 
                 databaseDirectory.createDirectory();
                 schemasDirectory.createDirectory();
-                affinitiesDirectory.createDirectory();
 
                 JSONObject info = getInfo();
                 JSONArray databases = info.getJSONArray("databases");

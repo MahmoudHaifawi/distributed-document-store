@@ -38,10 +38,12 @@ public final class HashRing {
 
     /**
      * The distinct physical nodes found walking clockwise from {@code key}'s position on the ring,
-     * closest first. Its size is {@code min(replicationFactor, physicalNodeCount())}.
+     * closest first. Its size is {@code min(replicationFactor, physicalNodeCount())}, but never less
+     * than one: a replication factor of zero or below is treated as one, so every key always has a
+     * primary (an empty list would leave a node with no owner to route to).
      */
     public List<Node> preferenceList(String key, int replicationFactor) {
-        int wanted = Math.min(replicationFactor, physicalNodeCount);
+        int wanted = Math.max(1, Math.min(replicationFactor, physicalNodeCount));
         long position = hash(key);
         Map<String, Node> owners = new LinkedHashMap<>();
         collectOwners(ring.tailMap(position, true).values(), owners, wanted);

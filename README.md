@@ -1,6 +1,6 @@
 # NoSQL-Database — Decentralized Document Store (Java / Spring Boot)
 
-A schema-enforced, **document-oriented NoSQL database** that runs as a small cluster of independent Java services. Data is stored as JSON files on each node's local disk, users are sharded across nodes, and every write is replicated to the whole cluster.
+A schema-enforced, **document-oriented NoSQL database** that runs as a small cluster of independent Java services. Data is stored as JSON files on each node's local disk, users are spread across nodes, and each schema is sharded onto a small set of replicas chosen by a consistent-hash ring (with virtual nodes).
 
 > This project was built for learning distributed-systems and DBMS internals. The README below describes **what the code actually does today**, including the parts that are scaffolded but not yet wired in.
 
@@ -13,7 +13,8 @@ A schema-enforced, **document-oriented NoSQL database** that runs as a small clu
 - [System architecture (diagram)](#system-architecture-diagram)
 - [How the cluster forms (bootstrapping)](#how-the-cluster-forms-bootstrapping)
 - [User routing & login](#user-routing--login)
-- [Writing a document (affinity + replication)](#writing-a-document-affinity--replication)
+- [Sharding & placement (consistent hashing)](#sharding--placement-consistent-hashing)
+- [Writing a document (primary + replication)](#writing-a-document-primary--replication)
 - [Reading documents (parallel read)](#reading-documents-parallel-read)
 - [On-disk storage layout](#on-disk-storage-layout)
 - [Data model & validation](#data-model--validation)
@@ -33,15 +34,16 @@ The system is **three separate Spring Boot applications** (Java 17, Spring Boot 
 | Module | Role | Talks to |
 |--------|------|----------|
 | **DBMS** | Client-facing gateway + Thymeleaf web UI (login/dashboard). Holds no data. | BootstrappingNode + Data Nodes (via REST) |
-| **BootstrappingNode** | Cluster coordinator: wires the node mesh at startup and routes users to nodes (round-robin). | Data Nodes (via REST) |
-| **Node** | The actual data node / storage engine. Stores JSON on local disk, authenticates users, replicates writes. | Every other Node in the mesh |
+| **BootstrappingNode** | Cluster coordinator: wires the node mesh at startup (from `CLUSTER_NODES`) and routes users to nodes (round-robin). | Data Nodes (via REST) |
+| **Node** | The actual data node / storage engine. Stores JSON on local disk, authenticates users, places each schema on the hash ring, and replicates writes to the schema's replicas. | Every other Node in the mesh |
 
 Key properties, as implemented:
 
 - **Document store, not a plain key-value store.** Data is organized as `database → schema → document`, and documents are validated against a typed schema before they are stored.
-- **Full replication.** Databases, users, schemas, and documents are broadcast to **every** node, so each node holds a complete copy of the data.
-- **Two forms of sharding.** *Users* are distributed round-robin across nodes by the BootstrappingNode; each *schema* is assigned an "affinity" (owner) node that coordinates its document writes.
-- **Static membership.** The cluster is a fixed, fully-connected **3-node mesh** (`Node0`, `Node1`, `Node2`) wired up by the BootstrappingNode at startup — there is no dynamic discovery or failure detection.
+- **Consistent-hash sharding by schema.** Each schema (its documents and its indexes) lives on `REPLICATION_FACTOR` replicas (default **3**, clamped to the cluster size). The replicas are picked by hashing `"<database>.<schema>"` onto a hash ring of virtual nodes (`VNODES_PER_NODE`, default **150**) and taking the next distinct nodes clockwise, so in a cluster larger than the replication factor a schema is stored on only *some* of the nodes. Placement is computed identically on every node — there is no central placement authority and no stored owner file.
+- **Primary-coordinated writes.** The first replica on a schema's preference list is its **primary**. It coordinates the schema's writes (schema create, document create/update/delete) and replicates them to the schema's other replicas only. Any node can be the entry point: it forwards a write to the primary, and forwards reads, index queries, and index listings to a replica when it does not hold the schema itself.
+- **Metadata stays fully replicated.** Database creation and user-add are still broadcast to **every** node, because every node needs the database directories and the user registry wherever the schemas land. *Users* are placed on an entry node round-robin by the BootstrappingNode.
+- **Static membership.** The cluster is a fixed, fully-connected mesh of the nodes listed in `CLUSTER_NODES` (the Docker demo runs five: `Node0`–`Node4`), wired up by the BootstrappingNode at startup, and every node builds its ring from that membership. There is no dynamic discovery, failure detection, or live rebalancing.
 - **File-based auth.** Users live in `info.json`; passwords are compared in plaintext; the "token" returned on login is simply the user's role string (`admin` / `user`).
 
 ---
@@ -54,15 +56,16 @@ A Spring MVC app (Thymeleaf) that a human uses through the browser. It stores **
 Controllers: `LoginController`, `DashboardController`, `AdminController` (`/admin/*`), `WriteController`.
 
 ### BootstrappingNode — coordinator & user router
-On startup (`CommandLineRunner`) it builds the mesh: for each of the three nodes it POSTs the *other* two to `/network/add/nodes` and POSTs the node itself to `/network/assign/self`. It also creates users (round-robin placement via `UsersLoadBalancer`, replicated by the target node) and answers "which node owns this user?" queries.
+On startup (`CommandLineRunner`) it builds the mesh: for each node in `CLUSTER_NODES` it POSTs the *other* nodes to `/network/add/nodes` and POSTs the node itself to `/network/assign/self`. It also creates users (round-robin placement via `UsersLoadBalancer`, replicated by the target node) and answers "which node owns this user?" queries.
 
 ### Node — data node / storage engine
-Each node is autonomous and holds a full copy of the data on its local filesystem. Responsibilities:
+Each node is autonomous and keeps its data on its local filesystem: every database directory and the user registry, plus the schemas (and their documents and indexes) that the hash ring places on it. Responsibilities:
 
 - **Storage** as JSON files under `./data/` (`FileReader` / `FileWriter` / `FileUpdater`, `DirectoryManager`).
 - **Authentication** against `info.json`; role-string tokens (`internal` / `admin` / `user`).
-- **Schema affinity & write coordination** (`AffinityLoadBalancer`): if a node receives a document write for a schema it doesn't own, it forwards the write to the owner; the owner writes locally and broadcasts to the mesh.
-- **Replication** of databases, users, schemas, and documents to all peers via thread-pool broadcasts. An `internal` token prevents re-broadcast loops.
+- **Schema placement & write coordination** (`HashRing`, `RingRouter`): the node hashes `"<database>.<schema>"` onto the ring to get the schema's replicas, primary first. If it receives a write for a schema whose primary is another node, it forwards the write there; the primary writes locally and replicates to the schema's other replicas.
+- **Read routing**: a read, index query, or index listing is served locally if this node is a replica of the schema, otherwise it is forwarded to the schema's primary.
+- **Replication** of schemas and documents to the schema's other replicas, and of databases and users to all peers, via thread-pool broadcasts. An `internal` token prevents re-broadcast loops.
 - **Parallel reads**: `read/all` fans a schema's documents across 4 threads.
 - **Validation** of schema field types and of documents against their schema.
 
@@ -79,34 +82,36 @@ graph TB
         FWD["REST forwarder<br/>token + nodeURL in session"]
     end
 
-    Boot["BootstrappingNode (port 8079)<br/>• wires the mesh at startup<br/>• round-robin user routing"]
+    Boot["BootstrappingNode (port 8079)<br/>• wires the mesh at startup (CLUSTER_NODES)<br/>• round-robin user routing"]
 
-    subgraph Cluster["Data Node mesh — full replication"]
+    subgraph Cluster["Data Node mesh — consistent-hash sharding (demo: 5 nodes, RF=3)"]
         N0["Node0 (8080)<br/>Spring Boot + local disk"]
-        N1["Node1 (8081)<br/>Spring Boot + local disk"]
-        N2["Node2 (8082)<br/>Spring Boot + local disk"]
+        N1["Node1 (8080)<br/>Spring Boot + local disk"]
+        N2["Node2 (8080)<br/>Spring Boot + local disk"]
+        N3["Node3 (8080)<br/>Spring Boot + local disk"]
+        N4["Node4 (8080)<br/>Spring Boot + local disk"]
     end
 
     D0[("Node0 ./data")]
     D1[("Node1 ./data")]
     D2[("Node2 ./data")]
+    D3[("Node3 ./data")]
+    D4[("Node4 ./data")]
 
     Browser -->|HTTP forms| UI
     UI --> FWD
     FWD -->|"getUserNode / createNewUser"| Boot
-    FWD -->|"login, admin, read, write (Authorization: token)"| N0
+    FWD -->|"login, admin, read, write (Authorization: token)<br/>to the user's entry node"| N0
 
-    Boot -.->|"startup: add/nodes + assign/self"| N0
-    Boot -.->|startup| N1
-    Boot -.->|startup| N2
+    Boot -.->|"startup: add/nodes + assign/self (every node)"| Cluster
 
-    N0 <-->|"replicate + forward writes"| N1
-    N1 <-->|replicate| N2
-    N0 <-->|replicate| N2
+    N0 <-->|"forward to a schema's primary / replicate to its replicas<br/>(any node can reach any other)"| N1
 
     N0 --- D0
     N1 --- D1
     N2 --- D2
+    N3 --- D3
+    N4 --- D4
 
     style Gateway fill:#e3f2fd,stroke:#1565c0
     style Boot fill:#fff3e0,stroke:#e65100
@@ -114,41 +119,37 @@ graph TB
     style Browser fill:#f3e5f5,stroke:#6a1b9a
 ```
 
-The DBMS forwards user-facing traffic to **one** node (the user's assigned node); that node handles the operation and, for writes, propagates it to the rest of the mesh.
+The DBMS forwards user-facing traffic to **one** node (the user's assigned *entry node*). That node serves the operation itself when it holds the schema, or hands it to the right node: a write goes to the schema's primary, which replicates it to the schema's other replicas; a read or index query goes to a replica. Database creation and user-add are broadcast to every node.
 
 ---
 
 ## How the cluster forms (bootstrapping)
 
-Membership is not discovered — it is configured. At startup the BootstrappingNode has a hardcoded list of three nodes and turns them into a fully-connected mesh where each node knows the other two and its own identity.
+Membership is not discovered — it is configured. At startup the BootstrappingNode reads the node list from the `CLUSTER_NODES` environment variable (comma-separated `host:port`; the Docker demo lists `Node0`–`Node4`, the local default is a single `localhost:8080`) and turns it into a fully-connected mesh where each node knows every other node and its own identity.
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant Boot as BootstrappingNode
-    participant N0 as Node0
-    participant N1 as Node1
-    participant N2 as Node2
+    participant Ni as Node i (each node in CLUSTER_NODES)
 
-    Note over Boot: nodes = [Node0, Node1, Node2] (hardcoded)
+    Note over Boot: nodes = CLUSTER_NODES<br/>(e.g. Node0 .. Node4)
 
-    Boot->>N0: POST /network/add/nodes  [Node1, Node2]
-    Boot->>N0: POST /network/assign/self  Node0
-    Boot->>N1: POST /network/add/nodes  [Node0, Node2]
-    Boot->>N1: POST /network/assign/self  Node1
-    Boot->>N2: POST /network/add/nodes  [Node0, Node1]
-    Boot->>N2: POST /network/assign/self  Node2
+    loop for every node i
+        Boot->>Ni: POST /network/add/nodes  [all nodes except i]
+        Boot->>Ni: POST /network/assign/self  Node i
+    end
 
-    Note over N0,N2: Each node now holds its peer list<br/>and its own identity (Network.nodes / Network.self)
+    Note over Ni: Each node now holds its peer list and its own identity<br/>(Network.nodes / Network.self) and builds the same hash ring from them
 ```
 
-Each node keeps its peer list and identity in a static in-memory `Network` (`nodes`, `self`). There is no heartbeat or re-join logic; if a node is down at startup, the corresponding call simply fails silently.
+Each node keeps its peer list and identity in a static in-memory `Network` (`nodes`, `self`), plus the consistent-hash ring (`Network.ring`) built from `nodes ∪ {self}`. The ring is rebuilt whenever membership is (re)assigned through `/network/*`, from the same inputs on every node, so all nodes agree on where each schema lives. There is no heartbeat or re-join logic; if a node is down at startup, the corresponding call is skipped.
 
 ---
 
 ## User routing & login
 
-Users are **sharded** across nodes. The BootstrappingNode assigns each new user to a node round-robin, and the node replicates the user record to the whole mesh so any node can later authenticate it. The DBMS asks the BootstrappingNode which node a returning user belongs to, then logs in against that node.
+Users are **spread** across nodes. The BootstrappingNode assigns each new user an entry node round-robin, and that node replicates the user record to the whole mesh (user-add is a full broadcast, not sharded by the ring) so any node can later authenticate it. The DBMS asks the BootstrappingNode which node a returning user belongs to, then logs in against that node.
 
 ```mermaid
 sequenceDiagram
@@ -185,38 +186,63 @@ sequenceDiagram
 
 ---
 
-## Writing a document (affinity + replication)
+## Sharding & placement (consistent hashing)
 
-Each schema has an **affinity node** — the node responsible for coordinating writes to that schema, chosen round-robin when the schema is created. When any node receives a document write, it checks the schema's affinity file. If it is not the owner, it forwards the write to the owner. The owner writes locally, then broadcasts the document to every node so all copies stay in sync.
+Each schema is placed on the cluster by a **consistent-hash ring with virtual nodes** (`HashRing`). The whole schema — its documents *and* its B+-tree indexes — lives on its replicas, so a query still reaches one node that holds the complete data and index.
+
+- **Ring.** Every physical node places `VNODES_PER_NODE` (default **150**) virtual points on a sorted ring, at the hash of `"<node name>#<i>"`. The hash is the first 8 bytes of an MD5 digest read as a long, which is stable across JVMs and evenly spread (unlike `String.hashCode`).
+- **Placement.** A schema's key is `"<database>.<schema>"`. Hash it, then walk the ring clockwise (wrapping around) collecting **distinct physical nodes** until `REPLICATION_FACTOR` (default **3**) are found. That ordered list is the schema's **preference list**; the first node is its **primary**. The replication factor is clamped to the cluster size (and floored at 1), so a 3-node cluster at the default behaves like full replication, while the 5-node Docker demo stores each schema on 3 of the 5 nodes. A node with no peers is the primary and sole replica of everything.
+- **No placement authority.** Every node builds the same ring from the shared membership (see [How the cluster forms](#how-the-cluster-forms-bootstrapping)), so each computes the same placement locally — nothing is stored per schema and no central service is consulted per request.
+- **Minimal movement.** Because the ring is consistent, adding a node to the membership moves only about 1/n of the schemas to a new primary, not most of them as modulo placement would (asserted in `HashRingTest`). Membership is static, so there is no live rebalancing or data migration: set `REPLICATION_FACTOR` and `VNODES_PER_NODE` before creating data.
+
+| Operation | Where it runs |
+|-----------|---------------|
+| Schema create; document create / update / delete | The schema's **primary**, then copied to the schema's **other replicas** only |
+| Read by id, read all, index query, index list | Served by the entry node if it is a replica of the schema; otherwise forwarded to the schema's primary |
+| Index create / drop | The primary, then the schema's other replicas (exactly the nodes that hold its data) |
+| Database create, user add | **Broadcast to every node** (cluster-wide metadata is not sharded) |
+
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| `REPLICATION_FACTOR` | `3` | Number of nodes that hold a copy of each schema (clamped to the cluster size) |
+| `VNODES_PER_NODE` | `150` | Virtual nodes each physical node places on the ring (smoother balance) |
+
+Replication is synchronous and best-effort: a write waits for the available replicas, and an unreachable replica surfaces as an error response without rolling back the others. There is no quorum, read-repair, or hinted handoff.
+
+---
+
+## Writing a document (primary + replication)
+
+Each schema has a **primary** — the first node on its preference list, responsible for coordinating writes to that schema. Any node can receive a client write. If it is not the schema's primary, it forwards the write to the primary (carrying the caller's token). The primary writes locally, then replicates the document to the schema's **other replicas** only, so all copies of that schema stay in sync. Nodes that are not replicas of the schema never receive the document.
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant DBMS as DBMS Gateway
     participant Nx as Receiving Node
-    participant Owner as Affinity Owner Node
-    participant Peers as All Nodes
+    participant Primary as Schema's Primary
+    participant Replicas as Other Replicas
 
     DBMS->>Nx: POST /write/document/new?database=&schema= (Authorization: token)
     Nx->>Nx: validate token + document not empty
 
     alt token == internal
-        Nx->>Nx: write locally only (no broadcast)
-    else external write
-        Nx->>Nx: AffinityLoadBalancer.checkAffinity(db, schema)
-        alt this node is NOT the owner
-            Nx->>Owner: forward POST /write/document/new
-            Owner-->>Nx: response
-        else this node IS the owner
+        Nx->>Nx: write locally only (no re-replication)
+    else client write
+        Nx->>Nx: ring lookup: is this node the primary of db.schema?
+        alt this node is NOT the primary
+            Nx->>Primary: forward POST /write/document/new
+            Primary-->>Nx: response
+        else this node IS the primary
             Nx->>Nx: validate document vs schema, assign nextId, write file
-            Nx->>Peers: broadcast document (Authorization: internal)
-            Peers-->>Nx: per-node responses
+            Nx->>Replicas: replicate document (Authorization: internal)
+            Replicas-->>Nx: per-replica responses
         end
     end
     Nx-->>DBMS: Vector<Response> (local + replica acks)
 ```
 
-Schema and database creation follow the same broadcast pattern: the receiving node applies the change locally, then propagates it to all peers using a 4-thread pool. `synchronized` blocks guard the file writes on each node.
+Schema creation and document update/delete are routed the same way: forwarded to the primary, applied there, then copied to the other replicas. Database creation is different: the receiving node applies the change locally, then propagates it to **all** peers (user-add works the same way), since every node needs the database directory regardless of where schemas land. Broadcasts and replication use a thread pool, and `synchronized` blocks guard the file writes on each node.
 
 Document IDs are sequential integers per schema, tracked by a `nextId` counter stored in the schema file.
 
@@ -224,7 +250,7 @@ Document IDs are sequential integers per schema, tracked by a `nextId` counter s
 
 ## Reading documents (parallel read)
 
-Reads are served from the local disk of the node handling the request. `read/all` splits the schema's document files into four contiguous ranges and reads them concurrently with four threads.
+Reads are served from the local disk of a replica of the schema: the entry node serves the read itself if it holds the schema, and otherwise forwards it to the schema's primary. `read/all` splits the schema's document files into four contiguous ranges and reads them concurrently with four threads.
 
 ```mermaid
 graph LR
@@ -251,17 +277,15 @@ graph LR
 
 ## On-disk storage layout
 
-Every node stores its full copy of the data under `./data/` (see `PathBuilder`). `info.json` holds the registry of databases and users; each database has `schemas/`, per-schema record folders, and `affinities/`.
+Every node stores its data under `./data/` (see `PathBuilder`). `info.json` holds the registry of databases and users, which every node has in full. Each database directory exists on every node, but a node only holds the `schemas/` entries and per-schema record folders of the schemas the ring places on it.
 
 ```mermaid
 graph TD
     Root["./data/"] --> Info["info.json<br/>{ databases: [...], users: {...} }"]
     Root --> DB["&lt;database&gt;/"]
     DB --> Schemas["schemas/"]
-    DB --> Affin["affinities/"]
     DB --> Recs["&lt;schema&gt;-records/"]
     Schemas --> SchemaFile["&lt;schema&gt;.json<br/>{ info: { schemaName, nextId }, schema: { field: type } }"]
-    Affin --> AffFile["&lt;schema&gt;.json<br/>{ Node: 'NodeN' }"]
     Recs --> Doc0["0.json"]
     Recs --> Doc1["1.json"]
     Recs --> DocN["&lt;nextId-1&gt;.json"]
@@ -274,10 +298,11 @@ Concrete paths:
 
 ```
 ./data/info.json                              # databases list + users
-./data/<database>/schemas/<schema>.json       # schema definition + nextId
-./data/<database>/affinities/<schema>.json    # which node owns this schema
-./data/<database>/<schema>-records/<id>.json  # one document per file
+./data/<database>/schemas/<schema>.json       # schema definition + nextId (only on the schema's replicas)
+./data/<database>/<schema>-records/<id>.json  # one document per file (only on the schema's replicas)
 ```
+
+There is no per-schema owner/placement file: which nodes hold a schema is computed from the hash ring, not stored.
 
 ---
 
@@ -310,9 +335,9 @@ Ports come from the code and container scripts, not the (inconsistent) `applicat
 |---------|------|--------|
 | DBMS (gateway/UI) | **8078** | `DbmsApplication` `WebServerFactoryCustomizer` |
 | BootstrappingNode | **8079** | `run.sh` (`-p 8079:8080`); DBMS calls `http://localhost:8079` |
-| Data nodes | **8080, 8081, 8082, …** | `run.sh` (`-p 808$i:8080`) |
+| Data nodes | **8080** (each node) | `CLUSTER_NODES` (`host:port` list); `docker-compose.yml` |
 
-Inside the Docker network, nodes address each other by container name (`Node0`, `Node1`, `Node2`) on port `8080`. When running outside Docker, the DBMS addresses nodes at `http://localhost:<port>`.
+Inside the Docker network, nodes address each other by service name (`Node0` … `Node4` in the demo) on port `8080`. When running outside Docker, the DBMS addresses nodes at `http://localhost:<port>`.
 
 ---
 
@@ -342,12 +367,12 @@ Inside the Docker network, nodes address each other by container name (`Node0`, 
 | Method | Path | Purpose |
 |--------|------|---------|
 | POST | `/login` | Authenticate against `info.json`; returns role token |
-| POST | `/admin/user/add` | Add user locally; broadcast if caller is admin |
-| POST | `/admin/database/create?databaseName=` | Create database locally; broadcast if admin |
-| POST | `/write/schema/new?database=` | Assign affinity, create schema, broadcast |
-| POST | `/write/document/new?database=&schema=` | Affinity-route, write, broadcast |
-| POST | `/user/read/document?id=&databaseName=&schemaName=` | Read one document by id |
-| POST | `/user/read/all?databaseName=&schemaName=` | Read all documents (4 threads) |
+| POST | `/admin/user/add` | Add user locally; broadcast to all nodes if caller is admin |
+| POST | `/admin/database/create?databaseName=` | Create database locally; broadcast to all nodes if admin |
+| POST | `/write/schema/new?database=` | Forward to the schema's primary, create schema, replicate to its other replicas |
+| POST | `/write/document/new?database=&schema=` | Forward to the schema's primary, write, replicate to its other replicas |
+| POST | `/user/read/document?id=&databaseName=&schemaName=` | Read one document by id (served by a replica, else forwarded) |
+| POST | `/user/read/all?databaseName=&schemaName=` | Read all documents (4 threads; served by a replica, else forwarded) |
 | POST | `/network/add/node` | Add a single peer |
 | POST | `/network/add/nodes` | Set the peer list |
 | POST | `/network/assign/self` | Set this node's identity |
@@ -365,27 +390,27 @@ All node data endpoints require an `Authorization` header carrying a role token 
 
 ### With Docker (provided scripts)
 
-The scripts build the `Node` image, create a bridge network, and start N data nodes plus the BootstrappingNode.
+The scripts wrap `docker compose`: one image is built from the root `Dockerfile` and started in different roles — five data nodes (`Node0`–`Node4`), the BootstrappingNode, and the DBMS gateway.
 
 ```bash
-# 1) Build the Node module and its Docker image
-./rebuild.sh
-
-# 2) Start the cluster (prompts for the number of data nodes; use 3 to match the mesh)
+# Build and start the whole cluster (then open http://localhost:8078/login)
 ./run.sh
 
-# 3) Tear everything down
+# Rebuild the image and restart the cluster in the background
+./rebuild.sh
+
+# Tear everything down
 ./stop.sh
 ```
 
-> The BootstrappingNode wires exactly three nodes (`Node0`, `Node1`, `Node2`). Start **3** data nodes so the mesh matches. The `rebuild.sh` script currently builds only the `Node` image; build and run the `BootstrappingNode` and `DBMS` images (or run them from your IDE) as well.
+> The demo runs 5 data nodes with `REPLICATION_FACTOR=3`, so each schema lives on 3 of the 5 nodes. The node list is `CLUSTER_NODES`, set identically on the coordinator and every node in `docker-compose.yml`. See [`RUN.md`](./RUN.md) for the roles, the `REPLICATION_FACTOR` / `VNODES_PER_NODE` settings, and the single-node local run.
 
 ### From an IDE / command line
 
 Each module is an independent Spring Boot app. Start them in this order:
 
 ```bash
-# Data nodes (run three instances; override the port per instance)
+# Data node(s) (a single node by default; for a cluster, run more instances and list them in CLUSTER_NODES)
 cd Node && ./mvnw spring-boot:run
 
 # Coordinator
@@ -395,7 +420,7 @@ cd BootstrappingNode && ./mvnw spring-boot:run
 cd DBMS && ./mvnw spring-boot:run
 ```
 
-Because the BootstrappingNode addresses nodes as `Node0/Node1/Node2:8080` and the DBMS addresses them as `localhost:<port>`, running fully outside Docker requires matching those hostnames/ports to your setup.
+The BootstrappingNode addresses data nodes by the `CLUSTER_NODES` list (default `localhost:8080`, a single node), so running a multi-node cluster fully outside Docker requires listing hostnames/ports that match your setup. With one node and no peers, the ring places every schema on that node.
 
 ---
 
@@ -403,7 +428,7 @@ Because the BootstrappingNode addresses nodes as `Node0/Node1/Node2:8080` and th
 
 ```
 .
-├─ BootstrappingNode/     # Coordinator: mesh setup + round-robin user routing
+├─ BootstrappingNode/     # Coordinator: mesh setup (CLUSTER_NODES) + round-robin user routing
 │  └─ src/main/java/.../  # BootstrappingNodeApplication, UserController, UsersLoadBalancer, models
 ├─ DBMS/                  # Gateway + Thymeleaf UI (login/dashboard); holds no data
 │  └─ src/main/
@@ -415,11 +440,12 @@ Because the BootstrappingNode addresses nodes as `Node0/Node1/Node2:8080` and th
 │     ├─ services/        # admin, authentication (+ RSAEncryption), read (+ indexing), write
 │     ├─ operations/      # admin & write file operations
 │     ├─ model/           # Node, Network, User
-│     └─ utils/           # AffinityLoadBalancer, PathBuilder, Token, Validators,
-│                         #   cache/ (LRU scaffold), directory/, file_operations/, response/
-├─ rebuild.sh             # Build Node module + Docker image
-├─ run.sh                 # Create network + start N nodes + BootstrappingNode
-├─ stop.sh                # Remove containers + network
+│     └─ utils/           # ring/ (HashRing, RingRouter, RingConfig), Forwarder, PathBuilder, Token,
+│                         #   Validators, cache/ (LRU scaffold), directory/, file_operations/, response/
+├─ docker-compose.yml     # 5 data nodes (RF=3) + BootstrappingNode + DBMS, one image
+├─ rebuild.sh             # Rebuild the image + restart the cluster (docker compose up --build -d)
+├─ run.sh                 # Build + start the cluster (docker compose up --build)
+├─ stop.sh                # Remove containers + network (docker compose down)
 ├─ Decentralized Cluster (Haifawi).pdf
 └─ NoSql DB.pdf
 ```
@@ -433,16 +459,19 @@ To keep this honest, here is what exists in the codebase but is **not yet functi
 | Component | Status |
 |-----------|--------|
 | Document store, schema validation, typed fields | ✅ Implemented |
-| Static 3-node mesh + startup wiring | ✅ Implemented |
-| User sharding (round-robin) + login routing | ✅ Implemented |
-| Full replication of DBs, users, schemas, documents | ✅ Implemented |
-| Schema affinity + write forwarding | ✅ Implemented |
+| Static mesh from `CLUSTER_NODES` + startup wiring | ✅ Implemented |
+| User placement (round-robin) + login routing | ✅ Implemented |
+| Consistent-hash ring with virtual nodes; each schema on `REPLICATION_FACTOR` replicas | ✅ Implemented |
+| Primary-coordinated writes replicated to the schema's other replicas | ✅ Implemented |
+| Read / index-query / index-list routing to a replica | ✅ Implemented |
+| Full broadcast of databases and users to all nodes | ✅ Implemented |
 | Parallel `read/all` (4 threads) | ✅ Implemented |
 | **LRU cache** (`Cache`, `DoubleLinkedList`) | ⚠️ Scaffolded — `add/get/remove/clear` are empty stubs; injected but unused |
 | **IndexingService** | ⚠️ Empty class |
 | **`RSAEncryption`** | ⚠️ Present but not wired into any request flow (and uses a symmetric key, not RSA) |
 | **Spring Security / JWT filter** | ⚠️ Commented out in `NodeApplication`; tokens are plain role strings |
 | Dynamic discovery / failure detection / quorum | ❌ Not present (membership is static) |
+| Live rebalancing / data migration when membership or the ring settings change | ❌ Not present (set `REPLICATION_FACTOR` / `VNODES_PER_NODE` before creating data) |
 
 ---
 

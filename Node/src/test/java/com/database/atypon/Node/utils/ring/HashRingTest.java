@@ -28,6 +28,17 @@ class HashRingTest {
     }
 
     @Test
+    void preferenceListFloorsReplicationFactorAtOne() {
+        HashRing ring = new HashRing(nodes(3), 150);
+
+        // A misconfigured REPLICATION_FACTOR of 0 or less must still place the key on one node;
+        // an empty list would leave no primary and make a node forward to itself forever.
+        assertThat(ring.preferenceList("k", 0)).hasSize(1);
+        assertThat(ring.preferenceList("k", -2)).hasSize(1);
+        assertThat(ring.preferenceList("k", 0).get(0).getName()).isEqualTo(ring.primary("k").getName());
+    }
+
+    @Test
     void placementIsDeterministicRegardlessOfNodeInputOrder() {
         List<Node> a = List.of(n("A"), n("B"), n("C"));
         List<Node> b = List.of(n("C"), n("A"), n("B"));
