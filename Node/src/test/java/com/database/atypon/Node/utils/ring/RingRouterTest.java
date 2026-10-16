@@ -176,6 +176,55 @@ class RingRouterTest {
         assertThat(Network.ring.physicalNodeCount()).isEqualTo(5);
     }
 
+    @Test
+    void setNodesAndAssignSelfBuildTheRingWithoutAnExplicitRebuild() {
+        Network network = new Network();
+        Network.self = null;
+        Network.ring = null;
+
+        network.setNodes(new ArrayList<>(List.of(n("Node1"), n("Node2"), n("Node3"), n("Node4"))));
+
+        assertThat(Network.ring).isNotNull();
+        assertThat(Network.ring.physicalNodeCount()).isEqualTo(4);
+        HashRing afterSetNodes = Network.ring;
+
+        network.assignSelf(n("Node0"));
+
+        assertThat(Network.ring).isNotNull().isNotSameAs(afterSetNodes);
+        assertThat(Network.ring.physicalNodeCount()).isEqualTo(5);
+        // Routing reflects the 5-node membership: the same placement a ring built by hand gives.
+        HashRing expected = new HashRing(
+                List.of(n("Node0"), n("Node1"), n("Node2"), n("Node3"), n("Node4")), RingConfig.vnodesPerNode());
+        int rf = Math.min(RingConfig.replicationFactor(), 5);
+        for (int i = 0; i < 50; i++) {
+            String schema = "schema" + i;
+            assertThat(names(RingRouter.replicasFor("shop", schema)))
+                    .isEqualTo(names(expected.preferenceList("shop." + schema, rf)));
+        }
+    }
+
+    @Test
+    void addNodeRebuildsTheRingWithoutAnExplicitRebuild() {
+        Network network = new Network();
+        Network.self = null;
+        Network.ring = null;
+        network.setNodes(new ArrayList<>(List.of(n("Node1"), n("Node2"), n("Node3"), n("Node4"))));
+        network.assignSelf(n("Node0"));
+        HashRing before = Network.ring;
+        assertThat(before.physicalNodeCount()).isEqualTo(5);
+
+        network.addNode(n("Node5"));
+
+        assertThat(Network.ring).isNotNull().isNotSameAs(before);
+        assertThat(Network.ring.physicalNodeCount()).isEqualTo(6);
+        // The new node now takes part in placement: it holds a replica of some schemas.
+        boolean newNodePlaced = false;
+        for (int i = 0; i < 100 && !newNodePlaced; i++) {
+            newNodePlaced = names(RingRouter.replicasFor("shop", "schema" + i)).contains("Node5");
+        }
+        assertThat(newNodePlaced).isTrue();
+    }
+
     private static void fiveNodeCluster() {
         Network.nodes = Collections.synchronizedList(
                 new ArrayList<>(List.of(n("Node1"), n("Node2"), n("Node3"), n("Node4"))));
