@@ -61,6 +61,14 @@ public class WriteService {
         }
     }
 
+    public Response repairDocument(String database, String schema, String id, HashMap<String, Object> winner) {
+        try {
+            return writeOperation.repairDocument(database, schema, id, new JSONObject(winner));
+        } catch (Exception e) {
+            return new Response(ResponseType.ERROR, e.getMessage());
+        }
+    }
+
     public Response deleteDocument(String database, String schema, String id, int expectedVersion) {
         try {
             return writeOperation.deleteDocument(database, schema, id, expectedVersion);

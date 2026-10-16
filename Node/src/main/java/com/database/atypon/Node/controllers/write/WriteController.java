@@ -116,6 +116,19 @@ public class WriteController {
         return withWriteQuorum(database, schema, result, replicaResponses);
     }
 
+    /**
+     * Read-repair, called by a peer that read a fresher copy of the document than the one here. Reachable
+     * by internal callers only (see SecurityConfig). It upgrades a present, older document and does nothing
+     * otherwise, so unlike {@code /document/update} it can never recreate a deleted document.
+     */
+    @PostMapping(value = "/document/repair", produces = "application/json")
+    public Vector<Response> repairDocument(@RequestParam String database,
+                                           @RequestParam String schema,
+                                           @RequestParam String id,
+                                           @RequestBody HashMap<String, Object> winner) {
+        return new Vector<>(List.of(writeService.repairDocument(database, schema, id, winner)));
+    }
+
     @PostMapping(value = "/document/delete", produces = "application/json")
     public Vector<Response> deleteDocument(@RequestParam String database,
                                            @RequestParam String schema,

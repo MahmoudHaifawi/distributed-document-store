@@ -38,8 +38,9 @@ import java.util.function.Supplier;
  * acknowledged version is seen whenever {@code W + R > N}. {@code R} then only says how many replicas
  * should have answered: fewer is a degraded read, which is still served from whatever was found.
  *
- * <p>A replica that answers "not found" is never written to: a document missing from one replica is
- * indistinguishable from one deleted there, and repair must not bring a deleted document back.
+ * <p>Repair never brings a deleted document back: a replica that answers "not found" is not written to,
+ * and the repair itself only upgrades a document that is still present (and older) on the replica when it
+ * is applied, rather than upserting it.
  */
 @Service
 public class QuorumReadService {
@@ -148,7 +149,11 @@ public class QuorumReadService {
         }
     }
 
-    /** Writes the winning document to every replica that holds an older copy of it. Best effort. */
+    /**
+     * Offers the winning document to every replica that held an older copy of it. Best effort. Each replica
+     * applies it through the conditional repair, which re-checks under its own write lock that the document
+     * is still there and still older, so a delete or a newer write that lands after the gather is not undone.
+     */
     private void repair(ReplicaDoc winner, ReplicaDoc local, List<ReplicaDoc> gathered, Map<String, Node> peers,
                         String db, String schema, String id) {
         List<Supplier<Response>> repairs = new ArrayList<>();
@@ -169,7 +174,7 @@ public class QuorumReadService {
     private Response repairLocal(ReplicaDoc winner, String db, String schema, String id) {
         try {
             HashMap<String, Object> document = new HashMap<>(new JSONObject(winner.content).toMap());
-            Response result = writeService.applyUpdate(db, schema, id, document);
+            Response result = writeService.repairDocument(db, schema, id, document);
             if (result.getResponseType() != ResponseType.SUCCESS) {
                 log.warn("read-repair of {}.{}/{} here failed: {}", db, schema, id, result.getMessage());
             }
@@ -186,7 +191,7 @@ public class QuorumReadService {
             headers.set("Authorization", ServiceTokens.bearer());
             headers.setContentType(MediaType.APPLICATION_JSON);
             REST.exchange(
-                    peer.getURL() + "/write/document/update?database={db}&schema={schema}&id={id}",
+                    peer.getURL() + "/write/document/repair?database={db}&schema={schema}&id={id}",
                     HttpMethod.POST, new HttpEntity<>(winner.content, headers), String.class, db, schema, id);
             return new Response(ResponseType.SUCCESS, "Replica repaired");
         } catch (Exception e) {

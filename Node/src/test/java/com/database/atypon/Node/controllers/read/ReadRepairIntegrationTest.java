@@ -19,6 +19,7 @@ import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.test.context.TestPropertySource;
 
@@ -179,11 +180,12 @@ class ReadRepairIntegrationTest {
                 .isEqualTo("/user/read/document?id=" + ID + "&databaseName=" + DB + "&schemaName=" + schema);
         assertThat(jwtService.role(bearerToken(first.reads().get(0)))).isEqualTo("INTERNAL");
 
-        // the stale replica was sent the winning document verbatim, as an internal peer write
+        // the stale replica was sent the winning document through the conditional repair endpoint (never the
+        // verbatim update, which would upsert), as an internal peer write
         assertThat(first.writes()).hasSize(1);
         Received repair = first.writes().get(0);
         assertThat(repair.uri())
-                .isEqualTo("/write/document/update?database=" + DB + "&schema=" + schema + "&id=" + ID);
+                .isEqualTo("/write/document/repair?database=" + DB + "&schema=" + schema + "&id=" + ID);
         assertThat(jwtService.role(bearerToken(repair))).isEqualTo("INTERNAL");
         JSONObject repaired = new JSONObject(repair.body());
         assertThat(repaired.getInt("_version")).isEqualTo(3);
@@ -261,6 +263,76 @@ class ReadRepairIntegrationTest {
         assertThat(new JSONObject(read.getString("content")).getInt("_version")).isEqualTo(3);
     }
 
+    @Test
+    void internalReadServesTheLocalCopyAndAsksNoPeer() throws IOException {
+        // an INTERNAL read is a peer coordinating its own quorum read: answering it by coordinating again
+        // would recurse across the cluster, so it must be served from this node's store alone
+        writeLocal(doc(7, 3));
+        first.holds(doc(5, 9));      // a fresher copy on a peer must not be consulted or returned
+        second.holds(doc(5, 9));
+
+        JSONObject read = new JSONObject(getAs(serviceBearer()).getBody());
+
+        assertThat(read.getString("responseType")).isEqualTo("SUCCESS");
+        assertThat(new JSONObject(read.getString("content")).getInt("_version")).isEqualTo(3);
+        assertThat(new JSONObject(read.getString("content")).getInt("n")).isEqualTo(7);
+        assertThat(first.received).isEmpty();
+        assertThat(second.received).isEmpty();
+    }
+
+    @Test
+    void internalReadOfAMissingLocalCopyIsNotFoundWithoutAskingAnyPeer() {
+        first.holds(doc(5, 9));      // a peer has it, but an internal read answers only for this node
+        second.holds(doc(5, 9));
+
+        JSONObject read = new JSONObject(getAs(serviceBearer()).getBody());
+
+        assertThat(read.getString("responseType")).isEqualTo("ERROR");
+        assertThat(read.getString("message")).isEqualTo("Document not found");
+        assertThat(first.received).isEmpty();
+        assertThat(second.received).isEmpty();
+        assertThat(Files.exists(localDocument())).isFalse();
+    }
+
+    @Test
+    void internalRepairEndpointOnlyUpgradesAPresentOlderDocument() throws IOException {
+        writeLocal(doc(1, 1));
+
+        repairAsInternal(doc(9, 3));
+        assertThat(new JSONObject(Files.readString(localDocument())).getInt("_version")).isEqualTo(3);
+
+        repairAsInternal(doc(4, 2));  // older than what is stored: must not regress it
+        JSONObject stored = new JSONObject(Files.readString(localDocument()));
+        assertThat(stored.getInt("_version")).isEqualTo(3);
+        assertThat(stored.getInt("n")).isEqualTo(9);
+
+        Files.delete(localDocument());
+        repairAsInternal(doc(9, 5));  // the document is gone here: must not be recreated
+        assertThat(Files.exists(localDocument())).isFalse();
+    }
+
+    @Test
+    void aClientCannotCallTheInternalRepairEndpoint() throws IOException {
+        writeLocal(doc(1, 1));
+
+        ResponseEntity<String> response = post(
+                "/write/document/repair?database=" + DB + "&schema=" + schema + "&id=" + ID,
+                "Bearer " + jwtService.generateToken("alice", "USER", Duration.ofMinutes(5)), doc(9, 3));
+
+        assertThat(response.getStatusCode().value()).isEqualTo(403);
+        assertThat(new JSONObject(Files.readString(localDocument())).getInt("_version")).isEqualTo(1);
+    }
+
+    private void repairAsInternal(String winner) {
+        ResponseEntity<String> response = post(
+                "/write/document/repair?database=" + DB + "&schema=" + schema + "&id=" + ID, serviceBearer(), winner);
+        assertThat(response.getStatusCode().value()).isEqualTo(200);
+    }
+
+    private String serviceBearer() {
+        return "Bearer " + jwtService.generateServiceToken();
+    }
+
     private static String doc(int n, int version) {
         return "{\"n\":" + n + ",\"_version\":" + version + "}";
     }
@@ -288,11 +360,24 @@ class ReadRepairIntegrationTest {
         throw new AssertionError("no schema held by this node");
     }
 
+    /** A client (USER) read by id. */
     private ResponseEntity<String> get() {
+        return getAs("Bearer " + jwtService.generateToken("alice", "USER", Duration.ofMinutes(5)));
+    }
+
+    private ResponseEntity<String> getAs(String authorization) {
         HttpHeaders headers = new HttpHeaders();
-        headers.set("Authorization", "Bearer " + jwtService.generateToken("alice", "USER", Duration.ofMinutes(5)));
+        headers.set("Authorization", authorization);
         return rest.exchange("http://localhost:" + port + "/user/read/document?id=" + ID
                         + "&databaseName=" + DB + "&schemaName=" + schema,
                 HttpMethod.GET, new HttpEntity<>(headers), String.class);
+    }
+
+    private ResponseEntity<String> post(String pathWithQuery, String authorization, String jsonBody) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.set("Authorization", authorization);
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        return rest.exchange("http://localhost:" + port + pathWithQuery, HttpMethod.POST,
+                new HttpEntity<>(jsonBody, headers), String.class);
     }
 }

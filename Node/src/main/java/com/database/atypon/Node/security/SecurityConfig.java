@@ -25,6 +25,7 @@ public class SecurityConfig {
                 .authorizeRequests()
                 .antMatchers("/login", "/health").permitAll()
                 .antMatchers("/network/**").hasRole("INTERNAL")
+                .antMatchers("/write/document/repair").hasRole("INTERNAL")
                 .antMatchers("/admin/**").hasRole("ADMIN")
                 .antMatchers("/user/**", "/write/**").hasRole("USER")
                 .anyRequest().authenticated()
