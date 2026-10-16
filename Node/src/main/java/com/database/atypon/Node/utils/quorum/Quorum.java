@@ -3,6 +3,7 @@ package com.database.atypon.Node.utils.quorum;
 import com.database.atypon.Node.utils.response.Response;
 import com.database.atypon.Node.utils.response.ResponseType;
 
+import java.util.ArrayList;
 import java.util.List;
 
 /** Pure quorum arithmetic shared by the write and read paths. */
@@ -39,6 +40,25 @@ public final class Quorum {
             }
         }
         return freshest;
+    }
+
+    /**
+     * The replicas read-repair should upgrade to {@code winner}: those that still hold the document
+     * ({@code present}) at a version below the winner's, in the order given. A replica that answered "not
+     * found" is never a target, so repair cannot re-create a missing document, and neither is the winner or
+     * any replica already at its version. Empty when {@code winner} is {@code null}.
+     */
+    public static List<ReplicaDoc> staleTargets(List<ReplicaDoc> docs, ReplicaDoc winner) {
+        List<ReplicaDoc> targets = new ArrayList<>();
+        if (winner == null) {
+            return targets;
+        }
+        for (ReplicaDoc doc : docs) {
+            if (doc.present && doc.version < winner.version) {
+                targets.add(doc);
+            }
+        }
+        return targets;
     }
 
     /**

@@ -34,13 +34,16 @@ import java.util.function.Supplier;
  * copy back to every replica that holds an older one (last-write-wins read-repair).
  *
  * <p>Asking all replicas, rather than only the {@code R} that the read consistency requires, means the
- * answers always overlap the {@code W} replicas that acknowledged the latest write, so the freshest
- * acknowledged version is seen whenever {@code W + R > N}. {@code R} then only says how many replicas
- * should have answered: fewer is a degraded read, which is still served from whatever was found.
+ * answers always overlap the {@code W} replicas that acknowledged the latest write. So read-your-writes
+ * ({@code W + R > N}) holds for document creates and updates: the freshest acknowledged version is seen.
+ * {@code R} then only says how many replicas should have answered: fewer is a degraded read, which is
+ * still served from whatever was found.
  *
- * <p>Repair never brings a deleted document back: a replica that answers "not found" is not written to,
- * and the repair itself only upgrades a document that is still present (and older) on the replica when it
- * is applied, rather than upserting it.
+ * <p>Deletes are not reconciled. There are no tombstones yet, so a replica that missed a delete can still
+ * return the document. Read-repair only upgrades an older copy that is still present: a replica that
+ * answers "not found" is not written to, and the repair itself only upgrades a document that is still
+ * present (and older) on the replica when it is applied, rather than upserting it, so it never re-creates
+ * a missing document. This applies to read-by-id only.
  */
 @Service
 public class QuorumReadService {
@@ -157,10 +160,7 @@ public class QuorumReadService {
     private void repair(ReplicaDoc winner, ReplicaDoc local, List<ReplicaDoc> gathered, Map<String, Node> peers,
                         String db, String schema, String id) {
         List<Supplier<Response>> repairs = new ArrayList<>();
-        for (ReplicaDoc copy : gathered) {
-            if (!copy.present || copy.version >= winner.version) {
-                continue;
-            }
+        for (ReplicaDoc copy : Quorum.staleTargets(gathered, winner)) {
             if (copy == local) {
                 repairs.add(() -> repairLocal(winner, db, schema, id));
             } else {
