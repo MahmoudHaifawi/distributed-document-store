@@ -1,19 +1,15 @@
 package com.database.atypon.Node.services.write;
 
-import com.database.atypon.Node.model.Network;
 import com.database.atypon.Node.model.Node;
 import com.database.atypon.Node.operations.write.WriteOperation;
-import com.database.atypon.Node.utils.AffinityLoadBalancer;
 import com.database.atypon.Node.utils.JsonKeys;
-import com.database.atypon.Node.utils.PathBuilder;
 import com.database.atypon.Node.utils.concurrent.Broadcaster;
-import com.database.atypon.Node.utils.file_operations.fileWriter.FileWriter;
 import com.database.atypon.Node.utils.response.Response;
 import com.database.atypon.Node.utils.response.ResponseType;
+import com.database.atypon.Node.utils.ring.RingRouter;
 import org.json.JSONObject;
 import org.springframework.stereotype.Service;
 
-import java.io.File;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -34,12 +30,6 @@ public class WriteService {
     public Response createSchema(String database, HashMap<String, Object> schema) {
             JSONObject schemaJSON = new JSONObject(schema);
             String schemaName = schemaJSON.get(JsonKeys.SCHEMA_NAME).toString();
-
-            // Assign the node affinity to the schema using the load balancer
-            String nodeAffinity = AffinityLoadBalancer.assignAffinity(database, schemaName);
-
-            // write the node affinity in the affinities directory
-            writeNodeAffinity(database, schemaName, nodeAffinity);
 
             JSONObject schemaDetails = schemaJSON.getJSONObject(JsonKeys.SCHEMA);
             return writeOperation.createSchema(database, schemaName, schemaDetails);
@@ -89,7 +79,8 @@ public class WriteService {
 
     public List<Response> broadcastSchema(String database, HashMap<String, Object> schema) {
         List<Supplier<Response>> tasks = new ArrayList<>();
-        for (Node node : Network.nodes) {
+        String schemaName = new JSONObject(schema).get(JsonKeys.SCHEMA_NAME).toString();
+        for (Node node : replicaTargets(database, schemaName)) {
             tasks.add(() -> node.createSchema(database, schema));
         }
         return Broadcaster.broadcast(tasks);
@@ -97,7 +88,7 @@ public class WriteService {
 
     public List<Response> broadcastDocument(String database, String schema, HashMap<String, Object> document) {
         List<Supplier<Response>> tasks = new ArrayList<>();
-        for (Node node : Network.nodes) {
+        for (Node node : replicaTargets(database, schema)) {
             tasks.add(() -> node.createDocument(database, schema, document));
         }
         return Broadcaster.broadcast(tasks);
@@ -106,7 +97,7 @@ public class WriteService {
     public List<Response> broadcastUpdate(String database, String schema, String id,
                                           HashMap<String, Object> document) {
         List<Supplier<Response>> tasks = new ArrayList<>();
-        for (Node node : Network.nodes) {
+        for (Node node : replicaTargets(database, schema)) {
             tasks.add(() -> node.updateDocument(database, schema, id, document));
         }
         return Broadcaster.broadcast(tasks);
@@ -114,25 +105,17 @@ public class WriteService {
 
     public List<Response> broadcastDelete(String database, String schema, String id) {
         List<Supplier<Response>> tasks = new ArrayList<>();
-        for (Node node : Network.nodes) {
+        for (Node node : replicaTargets(database, schema)) {
             tasks.add(() -> node.deleteDocument(database, schema, id));
         }
         return Broadcaster.broadcast(tasks);
     }
 
-    private void writeNodeAffinity(String database, String schemaName, String nodeAffinity) {
-        try{
-            String schemaAffinityPath = PathBuilder.getPathToAffinity(database, schemaName);
-            File schemaAffinityFile = new File(schemaAffinityPath);
-            schemaAffinityFile.createNewFile();
-
-            JSONObject schemaAffinity = new JSONObject();
-            schemaAffinity.put(JsonKeys.NODE, nodeAffinity);
-
-            FileWriter fileWriter = new FileWriter(schemaAffinityFile, schemaAffinity.toString());
-            fileWriter.write();
-        }catch (Exception e){
-            log.error("Failed to write node affinity", e);
-        }
+    /**
+     * The peers a write to this schema must be copied to: the schema's other replicas on the ring, not
+     * every node in the cluster. Empty on a single node.
+     */
+    List<Node> replicaTargets(String database, String schema) {
+        return RingRouter.otherReplicas(database, schema);
     }
 }

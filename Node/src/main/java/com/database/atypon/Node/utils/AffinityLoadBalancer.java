@@ -5,23 +5,7 @@ import com.database.atypon.Node.utils.response.Response;
 import com.database.atypon.Node.utils.response.ResponseType;
 import com.database.atypon.Node.utils.ring.RingRouter;
 
-import java.io.File;
-
 public class AffinityLoadBalancer {
-
-    public static String assignAffinity(String database, String schema){
-        String pathToAffinity = PathBuilder.getPathToAllAffinities(database);
-
-        File folder = new File(pathToAffinity);
-        int numberOfNodes = Network.nodes.size()+1;
-        int numberOfSchemas = 0;
-        if(folder.listFiles() != null)
-            numberOfSchemas = folder.listFiles().length;
-
-        int affinity = numberOfSchemas % numberOfNodes;
-
-        return "Node" + affinity;
-    }
 
     public static Response checkAffinity(String database, String schema){
         // Single-node cluster (no peers): this node owns every schema, so there is nothing to route

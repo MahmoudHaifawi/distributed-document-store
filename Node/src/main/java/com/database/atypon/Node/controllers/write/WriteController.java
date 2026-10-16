@@ -4,24 +4,20 @@ import com.database.atypon.Node.model.Node;
 import com.database.atypon.Node.security.SecurityUtils;
 import com.database.atypon.Node.services.write.WriteService;
 import com.database.atypon.Node.utils.AffinityLoadBalancer;
+import com.database.atypon.Node.utils.Forwarder;
+import com.database.atypon.Node.utils.JsonKeys;
 import com.database.atypon.Node.utils.response.Response;
 import com.database.atypon.Node.utils.response.ResponseType;
-import org.springframework.http.HttpEntity;
-import org.springframework.http.HttpHeaders;
+import com.database.atypon.Node.utils.ring.RingRouter;
 import org.springframework.web.bind.annotation.*;
-import org.springframework.web.client.RestTemplate;
 
 import java.util.HashMap;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Vector;
 
 @RestController
 @RequestMapping("/write")
 public class WriteController {
-
-    private static final org.slf4j.Logger log =
-            org.slf4j.LoggerFactory.getLogger(WriteController.class);
 
     private final WriteService writeService;
 
@@ -41,6 +37,16 @@ public class WriteController {
             return new Vector<>(List.of(new Response(ResponseType.ERROR, "Schema is empty")));
         if(database == null || database.isEmpty())
             return new Vector<>(List.of(new Response(ResponseType.ERROR, "Database name is empty")));
+
+        if (!isInternal()) {
+            // a client write goes to the schema's primary, which applies it and copies it to the replicas
+            Object schemaName = schema.get(JsonKeys.SCHEMA_NAME);
+            if (schemaName == null)
+                return new Vector<>(List.of(new Response(ResponseType.ERROR, "Schema name is empty")));
+            if (!RingRouter.isPrimary(database, schemaName.toString()))
+                return Forwarder.forwardForResponses(RingRouter.primaryFor(database, schemaName.toString()),
+                        "/write/schema/new?database=" + database, schema);
+        }
 
         Vector<Response> responses = new Vector<>();
         responses.add(writeService.createSchema(database, schema));
@@ -72,19 +78,8 @@ public class WriteController {
         Vector<Response> responses = new Vector<>();
         if(affinityResponse.getResponseType() == ResponseType.ERROR){
             Node node = (Node) affinityResponse.getContent();
-            String url = node.getURL() + "/write/document/new?database=" + database + "&schema=" + schema;
-            Thread t = new Thread(()->{
-                synchronized (responses) {
-                    responses.addAll(forwardRequest(url, document));
-                }
-            });
-            t.start();
-            try{
-                t.join();
-            }catch (InterruptedException e){
-                log.error("Interrupted while waiting for forwarded request", e);
-            }
-            return responses;
+            return Forwarder.forwardForResponses(node,
+                    "/write/document/new?database=" + database + "&schema=" + schema, document);
         }
         responses.add(writeService.createDocument(database, schema, document));
 
@@ -101,6 +96,10 @@ public class WriteController {
                                            @RequestBody HashMap<String, Object> document) {
         if (isInternal())
             return new Vector<>(List.of(writeService.applyUpdate(database, schema, id, document)));
+
+        if (!RingRouter.isPrimary(database, schema))
+            return Forwarder.forwardForResponses(RingRouter.primaryFor(database, schema),
+                    "/write/document/update?database=" + database + "&schema=" + schema + "&id=" + id, document);
 
         int expectedVersion = 1;
         Object v = document.get("_version");
@@ -127,6 +126,11 @@ public class WriteController {
         if (isInternal())
             return new Vector<>(List.of(writeService.applyDelete(database, schema, id)));
 
+        if (!RingRouter.isPrimary(database, schema))
+            return Forwarder.forwardForResponses(RingRouter.primaryFor(database, schema),
+                    "/write/document/delete?database=" + database + "&schema=" + schema + "&id=" + id
+                            + "&version=" + version, null);
+
         Vector<Response> responses = new Vector<>();
         Response result = writeService.deleteDocument(database, schema, id, version);
         responses.add(result);
@@ -134,27 +138,5 @@ public class WriteController {
             responses.addAll(writeService.broadcastDelete(database, schema, id));
         }
         return responses;
-    }
-
-    private Vector<Response> forwardRequest(String url, HashMap<String, Object> document) {
-        try{
-            HttpHeaders headers = new HttpHeaders();
-            // forward the caller's JWT so the affinity owner handles it as the origin (writes + broadcasts)
-            headers.set("Authorization", "Bearer " + SecurityUtils.currentToken());
-            HttpEntity request = new HttpEntity(document, headers);
-            RestTemplate restTemplate = new RestTemplate();
-
-            Vector<LinkedHashMap> returned = restTemplate.postForObject(url, request, Vector.class);
-            Vector<Response> responses = new Vector<>();
-
-            for(LinkedHashMap response : returned)
-                responses.add(new Response(ResponseType.valueOf((String) response.get("responseType")),
-                        (String) response.get("message")));
-
-            return responses;
-
-        }catch (Exception e){
-            return new Vector<>(List.of(new Response(ResponseType.ERROR, "Error forwarding request", e.getMessage())));
-        }
     }
 }
