@@ -46,12 +46,12 @@ to node, e.g. `docker compose exec Node0 ls /app/data/<database>`.
 
 These environment variables tune the ring and the consistency levels (all optional):
 
-| Variable             | Default  | Meaning                                                                                     |
-|----------------------|----------|---------------------------------------------------------------------------------------------|
-| `REPLICATION_FACTOR` | `3`      | Number of nodes that hold a copy of each schema (clamped to cluster size)                   |
-| `VNODES_PER_NODE`    | `150`    | Virtual nodes each physical node places on the ring (smoother balance)                      |
-| `WRITE_CONSISTENCY`  | `QUORUM` | `ONE`/`QUORUM`/`ALL`: replicas that must persist a write before it is acknowledged (`W`)    |
-| `READ_CONSISTENCY`   | `QUORUM` | `ONE`/`QUORUM`/`ALL`: replicas a read expects to answer; stale ones are read-repaired (`R`) |
+| Variable             | Default  | Meaning                                                                                                     |
+|----------------------|----------|-------------------------------------------------------------------------------------------------------------|
+| `REPLICATION_FACTOR` | `3`      | Number of nodes that hold a copy of each schema (clamped to cluster size)                                   |
+| `VNODES_PER_NODE`    | `150`    | Virtual nodes each physical node places on the ring (smoother balance)                                      |
+| `WRITE_CONSISTENCY`  | `QUORUM` | `ONE`/`QUORUM`/`ALL`: replicas that must persist a schema or document write before it is acknowledged (`W`) |
+| `READ_CONSISTENCY`   | `QUORUM` | `ONE`/`QUORUM`/`ALL`: replicas a read by id expects to answer; stale ones are read-repaired (`R`)           |
 
 Each node builds the ring from the cluster membership that the coordinator wires up from
 `CLUSTER_NODES` (only the coordinator reads that variable), so every node computes the same
@@ -67,24 +67,39 @@ must take part in each write and read, with `WRITE_CONSISTENCY` (`W`) and `READ_
 the table above. Each is one of `ONE` (1 replica), `QUORUM` (a majority, `N/2 + 1`) or `ALL` (every
 replica); both default to `QUORUM`.
 
-- **Writes:** the schema's primary applies a write and copies it to the other replicas, and the client
-  is told it succeeded only when at least `W` replicas (the primary included) persisted it. With fewer
-  than `W`, the client gets a "write quorum not met" error instead of a false success; the copies that
-  did persist are kept, not rolled back.
+- **Writes:** the schema's primary applies a schema or document write (create, update, delete) and
+  copies it to the other replicas, and the client is told it succeeded only when at least `W` replicas
+  (the primary included) persisted it. With fewer than `W`, the client gets a "write quorum not met"
+  error instead of a false success; the copies that did persist are kept, not rolled back. Creating a
+  database or a user is not gated by `W`.
 - **Reads:** a read by document id asks the schema's replicas and answers with the freshest copy
   (last-write-wins by document version). It then **read-repairs** every replica that held an older copy
   of it. `R` is how many replicas must have answered; fewer than `R` is logged as a degraded read but
   is still served from whatever was found.
-- **Read-your-writes:** if `W + R > N`, every read quorum overlaps every write quorum, so a read sees the
-  latest acknowledged write. `QUORUM`/`QUORUM` satisfies this for any `N`.
+- **Read-your-writes (create and update):** if `W + R > N`, every read quorum overlaps every write
+  quorum, so a read by id sees the latest acknowledged document create or update. `QUORUM`/`QUORUM`
+  satisfies this for any `N`.
+- **Limitation, deletes:** read-repair upgrades an older copy that is still present. It does **not**
+  re-create a missing document or reconcile deletes (there are no tombstones yet, so a replica that
+  missed a delete can still return the document), and it applies to read-by-id only.
 
 The compose demo runs 5 nodes with `REPLICATION_FACTOR=3` and `WRITE_CONSISTENCY=READ_CONSISTENCY=QUORUM`,
-so `W = R = 2` and `W + R = 4 > 3`. A write therefore **survives one replica being down** (the other two
-still meet the quorum), and a read **heals a replica that missed an update**. To see it: create a
-document, stop one of its schema's replicas other than the primary (`docker compose stop Node1`; the
-primary takes the write, so if you stop that one the update is rejected, try another), update the
-document (still acknowledged), start the node again (`docker compose start Node1`) and read the document
-back. The read returns the latest version and repairs the stale replica.
+so `W = R = 2` and `W + R = 4 > 3`. A document write therefore **survives one replica being down** (the
+other two still meet the quorum), and a read **heals a replica that missed an update**. To see it:
+
+1. Create a document, and note which nodes hold its schema (`docker compose exec Node0 ls /app/data/<database>`
+   and likewise on the others).
+2. Stop one of the schema's replicas other than the primary, e.g. `docker compose stop Node1`. The
+   primary takes the write, so if you happen to stop it the update is rejected; try another replica.
+3. Update the document. It is still acknowledged, because the remaining two replicas meet the quorum.
+4. Bring the node back with `docker compose start Node1`, then **re-wire the mesh** with
+   `docker compose restart bootstrappingnode`. Cluster membership lives in memory and is wired once by
+   the coordinator at startup, so a node that was restarted comes up knowing no peers; until it is
+   re-wired it treats itself as a single node and serves its own stale copy without repairing it. Use
+   `stop`/`start`, not `down`, so the node keeps its data.
+5. Read the document by id. The read returns the latest version and repairs the stale replica.
+   (Alternatively, skip the re-wire and issue the read through a different node than the restarted one:
+   the peer reads and repairs between nodes need no mesh, so that read repairs the restarted node too.)
 
 `ONE` favours availability and speed at the price of stale reads; `ALL` favours strength at the price of
 write availability. On a single node (`N = 1`) every level collapses to 1, so the local run behaves as

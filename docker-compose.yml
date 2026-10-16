@@ -14,9 +14,13 @@
 # and on every node via the shared x-cluster-env block below.
 #
 # Tunable consistency (M7): WRITE_CONSISTENCY / READ_CONSISTENCY (ONE | QUORUM | ALL) set how many of a
-# schema's replicas must acknowledge a write (W) and answer a read (R). With RF=3, QUORUM is 2 of 3, so
-# W + R = 4 > 3 gives read-your-writes, a write survives one replica being down, and a read repairs a
-# replica that missed an update (last-write-wins by version). Set identically on every node.
+# schema's replicas must acknowledge a schema/document write (W) and answer a read by id (R). With RF=3,
+# QUORUM is 2 of 3, so W + R = 4 > 3 gives read-your-writes for document creates and updates, a write
+# survives one replica being down, and a read repairs a replica that missed an update (last-write-wins by
+# version). Deletes are not reconciled (no tombstones yet): a replica that missed one can still return
+# the document. A node restarted with `docker compose start` must be re-wired with
+# `docker compose restart bootstrappingnode` before it serves reads as part of the cluster (see RUN.md).
+# Set identically on every node.
 x-cluster-env: &cluster-env
   CLUSTER_NODES: "Node0:8080,Node1:8080,Node2:8080,Node3:8080,Node4:8080"
   REPLICATION_FACTOR: "3"
