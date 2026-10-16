@@ -27,6 +27,21 @@ public final class Quorum {
     }
 
     /**
+     * The freshest copy among the replicas' answers: the present document with the highest version, or
+     * {@code null} when no replica holds the document. Versions are assigned by the schema's single primary,
+     * so two copies at the same version are identical and either may be returned.
+     */
+    public static ReplicaDoc pickFreshest(List<ReplicaDoc> docs) {
+        ReplicaDoc freshest = null;
+        for (ReplicaDoc doc : docs) {
+            if (doc.present && (freshest == null || doc.version > freshest.version)) {
+                freshest = doc;
+            }
+        }
+        return freshest;
+    }
+
+    /**
      * Total acknowledgements for a write: one for the local apply if it succeeded, plus one for
      * every replica response of type {@link ResponseType#SUCCESS}.
      */
