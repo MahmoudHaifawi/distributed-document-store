@@ -1,11 +1,9 @@
 package com.database.atypon.Node.utils;
 
 import com.database.atypon.Node.model.Network;
-import com.database.atypon.Node.model.Node;
-import com.database.atypon.Node.utils.file_operations.fileReader.FileReader;
 import com.database.atypon.Node.utils.response.Response;
 import com.database.atypon.Node.utils.response.ResponseType;
-import org.json.JSONObject;
+import com.database.atypon.Node.utils.ring.RingRouter;
 
 import java.io.File;
 
@@ -32,20 +30,9 @@ public class AffinityLoadBalancer {
         if (Network.nodes == null || Network.nodes.isEmpty())
             return new Response(ResponseType.SUCCESS, "Single node owns all schemas");
 
-        String pathToAffinity = PathBuilder.getPathToAffinity(database, schema);
-
-        File file = new File(pathToAffinity);
-
-        if(!file.exists())
-            return new Response(ResponseType.ERROR, "Affinity file does not exist");
-
-        FileReader reader = new FileReader(new File(pathToAffinity));
-        reader.read();
-        JSONObject affinityJSON = new JSONObject(reader.getContent());
-        String node = affinityJSON.getString(JsonKeys.NODE);
-
-        if(Network.getSelf().getName().equals(node))
+        // The schema's primary is wherever the consistent-hash ring places it; no per-schema file to consult.
+        if (RingRouter.isPrimary(database, schema))
             return new Response(ResponseType.SUCCESS, "Affinity is correct");
-        return new Response(ResponseType.ERROR, "Affinity is incorrect", Node.nodeBuilder(node));
+        return new Response(ResponseType.ERROR, "Affinity is incorrect", RingRouter.primaryFor(database, schema));
     }
 }
