@@ -46,10 +46,13 @@ class WriteOperationDeleteTest {
     }
 
     @Test
-    void deleteWithMatchingVersionRemovesFileAndFiresOnDelete() throws Exception {
+    void deleteWithMatchingVersionTombstonesTheFileAndFiresOnDelete() throws Exception {
         var resp = writeOp.deleteDocument("deldb", "users", "0", 1);
         assertThat(resp.getResponseType()).isEqualTo(ResponseType.SUCCESS);
-        assertThat(new File("./data/deldb/users-records/0.json")).doesNotExist();
+        // M8: a delete overwrites the file with a tombstone instead of removing it
+        assertThat(new File("./data/deldb/users-records/0.json")).exists();
+        assertThat(new JSONObject(Files.readString(db.resolve("users-records").resolve("0.json")))
+                .getBoolean("_deleted")).isTrue();
         verify(indexManagerMock).onDelete(eq("deldb"), eq("users"), eq(0), any());
     }
 
@@ -69,10 +72,13 @@ class WriteOperationDeleteTest {
     }
 
     @Test
-    void applyDeleteRemovesFileWithoutVersionCheck() throws Exception {
+    void applyDeleteTombstonesTheFileWithoutVersionCheck() throws Exception {
         var resp = writeOp.applyDelete("deldb", "users", "0");
         assertThat(resp.getResponseType()).isEqualTo(ResponseType.SUCCESS);
-        assertThat(new File("./data/deldb/users-records/0.json")).doesNotExist();
+        // M8: the replica's copy becomes a tombstone (the file is kept), not an absence
+        assertThat(new File("./data/deldb/users-records/0.json")).exists();
+        assertThat(new JSONObject(Files.readString(db.resolve("users-records").resolve("0.json")))
+                .getBoolean("_deleted")).isTrue();
     }
 
     @Test

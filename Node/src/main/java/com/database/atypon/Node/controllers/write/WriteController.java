@@ -11,6 +11,7 @@ import com.database.atypon.Node.utils.quorum.Quorum;
 import com.database.atypon.Node.utils.response.Response;
 import com.database.atypon.Node.utils.response.ResponseType;
 import com.database.atypon.Node.utils.ring.RingRouter;
+import org.json.JSONObject;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.HashMap;
@@ -70,8 +71,8 @@ public class WriteController {
         if(schema == null || schema.isEmpty())
             return new Vector<>(List.of(new Response(ResponseType.ERROR, "Schema name is empty")));
 
-        if(isInternal())
-            return new Vector<>(List.of(writeService.createDocument(database, schema, document)));
+        if(isInternal()) // a replica keeps the clock the primary stamped on the document
+            return new Vector<>(List.of(writeService.createReplicatedDocument(database, schema, document)));
 
         //forward the request to another node if the node affinity is not the current node
         Response affinityResponse = AffinityLoadBalancer.checkAffinity(database, schema);
@@ -109,7 +110,7 @@ public class WriteController {
 
         List<Response> replicaResponses = List.of();
         if (result.getResponseType() == ResponseType.SUCCESS) {
-            // stamp the new version onto the document and replicate it verbatim to peers
+            // the origin stamped the new version, clock and timestamp onto the document; replicate it to peers
             document.put("_version", ((Number) result.getContent()).intValue());
             replicaResponses = writeService.broadcastUpdate(database, schema, id, document);
         }
@@ -149,10 +150,17 @@ public class WriteController {
 
         Response result = writeService.deleteDocument(database, schema, id, version);
 
+        // the delete left a tombstone here; replicas apply that same tombstone causally rather than each
+        // making up its own delete, so a replica that already holds a newer write is not overridden
         List<Response> replicaResponses = result.getResponseType() == ResponseType.SUCCESS
-                ? writeService.broadcastDelete(database, schema, id)
+                ? writeService.broadcastUpdate(database, schema, id, tombstoneOf(result))
                 : List.of();
         return withWriteQuorum(database, schema, result, replicaResponses);
+    }
+
+    /** The tombstone a successful origin delete returned (as a JSON string in its content), as a replicable map. */
+    private static HashMap<String, Object> tombstoneOf(Response deleteResult) {
+        return new HashMap<>(new JSONObject(String.valueOf(deleteResult.getContent())).toMap());
     }
 
     /**

@@ -59,11 +59,28 @@ class WriteControllerDeleteTest {
     void userRoleDeletesWithExpectedVersion() {
         authenticateAs("ADMIN");
         when(writeService.deleteDocument(eq("db"), eq("s"), eq("0"), eq(2)))
-                .thenReturn(new Response(ResponseType.SUCCESS, "deleted"));
+                .thenReturn(new Response(ResponseType.SUCCESS, "deleted",
+                        "{\"_deleted\":true,\"_version\":3,\"_vclock\":{\"n\":3},\"_ts\":7}"));
 
         Vector<Response> out = controller.deleteDocument("db", "s", "0", 2);
 
         assertThat(out.get(0).getResponseType()).isEqualTo(ResponseType.SUCCESS);
         verify(writeService).deleteDocument(eq("db"), eq("s"), eq("0"), eq(2));
+    }
+
+    @Test
+    void userRoleReplicatesTheTombstoneNotABareDelete() {
+        authenticateAs("ADMIN");
+        when(writeService.deleteDocument(eq("db"), eq("s"), eq("0"), eq(2)))
+                .thenReturn(new Response(ResponseType.SUCCESS, "deleted",
+                        "{\"_deleted\":true,\"_version\":3,\"_vclock\":{\"n\":3},\"_ts\":7}"));
+
+        controller.deleteDocument("db", "s", "0", 2);
+
+        org.mockito.ArgumentCaptor<java.util.HashMap<String, Object>> sent = org.mockito.ArgumentCaptor.forClass(java.util.HashMap.class);
+        verify(writeService).broadcastUpdate(eq("db"), eq("s"), eq("0"), sent.capture());
+        assertThat(sent.getValue()).containsEntry("_deleted", true).containsEntry("_version", 3);
+        assertThat(sent.getValue().get("_vclock")).isEqualTo(java.util.Map.of("n", 3));
+        verify(writeService, never()).broadcastDelete(any(), any(), any());
     }
 }

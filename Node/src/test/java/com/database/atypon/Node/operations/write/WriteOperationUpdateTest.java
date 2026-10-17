@@ -85,8 +85,13 @@ class WriteOperationUpdateTest {
     }
 
     @Test
-    void applyUpdateWritesVerbatimWithoutVersionCheck() throws Exception {
-        var resp = writeOp.applyUpdate("updb", "users", "0", new JSONObject().put("Age", 7).put("_version", 9));
+    void applyUpdateWritesTheDominatingCopyWithoutVersionCheck() throws Exception {
+        // M8: applyUpdate is a causal reconcile, not a blind upsert, so the incoming copy must descend the local
+        // one ({localhost:1}) to be stored; the version is then taken from the document, not incremented
+        JSONObject local = new JSONObject(Files.readString(db.resolve("users-records").resolve("0.json")));
+        JSONObject newer = new JSONObject().put("Age", 7).put("_version", 9)
+                .put("_vclock", local.getJSONObject("_vclock").put("replica", 4)).put("_ts", 1L);
+        var resp = writeOp.applyUpdate("updb", "users", "0", newer);
         assertThat(resp.getResponseType()).isEqualTo(ResponseType.SUCCESS);
         JSONObject stored = new JSONObject(Files.readString(db.resolve("users-records").resolve("0.json")));
         assertThat(stored.getInt("Age")).isEqualTo(7);

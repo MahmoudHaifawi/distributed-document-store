@@ -35,22 +35,58 @@ public class WriteService {
             return writeOperation.createSchema(database, schemaName, schemaDetails);
     }
 
+    /**
+     * Origin create. On success the stamp this node gave the document (version, vector clock, timestamp) is
+     * copied back onto {@code document}, so the caller can replicate that same map and every replica stores the
+     * origin's stamp instead of making its own.
+     */
     public Response createDocument(String database, String schema, HashMap<String, Object> document) {
         try{
             JSONObject documentJSON = new JSONObject(document);
-            return writeOperation.createDocument(database, schema, documentJSON);
+            Response response = writeOperation.createDocument(database, schema, documentJSON);
+            if (response.getResponseType() == ResponseType.SUCCESS)
+                copyOriginStamp(documentJSON, document);
+            return response;
         } catch (Exception e){
             return new Response(ResponseType.ERROR, e.getMessage());
         }
     }
 
-    public Response updateDocument(String database, String schema, String id,
-                                   HashMap<String, Object> document, int expectedVersion) {
+    /** Replica side of a create: keeps the stamp the origin put on {@code document}. */
+    public Response createReplicatedDocument(String database, String schema, HashMap<String, Object> document) {
         try {
-            return writeOperation.updateDocument(database, schema, id, new JSONObject(document), expectedVersion);
+            return writeOperation.createReplicatedDocument(database, schema, new JSONObject(document));
         } catch (Exception e) {
             return new Response(ResponseType.ERROR, e.getMessage());
         }
+    }
+
+    /**
+     * Origin update. As with {@link #createDocument}, the new version, clock and timestamp are copied back onto
+     * {@code document} on success so the caller replicates the stamped document.
+     */
+    public Response updateDocument(String database, String schema, String id,
+                                   HashMap<String, Object> document, int expectedVersion) {
+        try {
+            JSONObject documentJSON = new JSONObject(document);
+            Response response = writeOperation.updateDocument(database, schema, id, documentJSON, expectedVersion);
+            if (response.getResponseType() == ResponseType.SUCCESS)
+                copyOriginStamp(documentJSON, document);
+            return response;
+        } catch (Exception e) {
+            return new Response(ResponseType.ERROR, e.getMessage());
+        }
+    }
+
+    /** Copies the server-controlled keys of a stamped document onto the map that is replicated to peers. */
+    private static void copyOriginStamp(JSONObject stamped, HashMap<String, Object> into) {
+        for (String key : List.of(JsonKeys.VERSION, JsonKeys.VCLOCK, JsonKeys.TS)) {
+            if (!stamped.has(key))
+                continue;
+            Object value = stamped.get(key);
+            into.put(key, value instanceof JSONObject ? ((JSONObject) value).toMap() : value);
+        }
+        into.remove(JsonKeys.DELETED);
     }
 
     public Response applyUpdate(String database, String schema, String id, HashMap<String, Object> document) {
