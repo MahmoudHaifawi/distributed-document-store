@@ -72,16 +72,15 @@ replica); both default to `QUORUM`.
   (the primary included) persisted it. With fewer than `W`, the client gets a "write quorum not met"
   error instead of a false success; the copies that did persist are kept, not rolled back. Creating a
   database or a user is not gated by `W`.
-- **Reads:** a read by document id asks the schema's replicas and answers with the freshest copy
-  (last-write-wins by document version). It then **read-repairs** every replica that held an older copy
-  of it. `R` is how many replicas must have answered; fewer than `R` is logged as a degraded read but
-  is still served from whatever was found.
-- **Read-your-writes (create and update):** if `W + R > N`, every read quorum overlaps every write
-  quorum, so a read by id sees the latest acknowledged document create or update. `QUORUM`/`QUORUM`
-  satisfies this for any `N`.
-- **Limitation, deletes:** read-repair upgrades an older copy that is still present. It does **not**
-  re-create a missing document or reconcile deletes (there are no tombstones yet, so a replica that
-  missed a delete can still return the document), and it applies to read-by-id only.
+- **Reads:** a read by document id asks the schema's replicas, reconciles the copies it gets by vector
+  clock (see [Conflict resolution and deletes](#conflict-resolution-and-deletes)) into one winner, and
+  answers with it. It then **read-repairs** every replica whose copy differs from the winner, a replica
+  that has no copy included. `R` is how many replicas must have answered; fewer than `R` is logged as a
+  degraded read but is still served from whatever was found.
+- **Read-your-writes (create, update and delete):** if `W + R > N`, every read quorum overlaps every
+  write quorum, so a read by id sees the latest acknowledged document create, update or delete.
+  `QUORUM`/`QUORUM` satisfies this for any `N`.
+- **Scope:** read-repair applies to read-by-id only.
 
 The compose demo runs 5 nodes with `REPLICATION_FACTOR=3` and `WRITE_CONSISTENCY=READ_CONSISTENCY=QUORUM`,
 so `W = R = 2` and `W + R = 4 > 3`. A document write therefore **survives one replica being down** (the
@@ -105,6 +104,39 @@ other two still meet the quorum), and a read **heals a replica that missed an up
 write availability. On a single node (`N = 1`) every level collapses to 1, so the local run behaves as
 before. The levels are read by each node itself and must match on every node; `docker-compose.yml` sets
 them in the same shared `x-cluster-env` block.
+
+### Conflict resolution and deletes
+
+Every document carries a **vector clock** (`_vclock`: one counter per node, bumped by the node that
+coordinates the write) and a coordination timestamp (`_ts`). These, and `_version` and `_deleted`, are
+server-controlled keys that clients do not set. When two replicas hold different copies of a document,
+reconciliation compares their clocks:
+
+- If one copy **causally follows** the other (its clock has seen everything the other's has), the newer
+  copy is kept, even if its wall-clock timestamp is lower.
+- If neither does, the writes were genuinely **concurrent**. The cluster **auto-resolves** them
+  deterministically in favour of the copy with the latest `_ts` (ties broken by the clock itself), and
+  stamps the winner with the merged clock so it supersedes both. It does **not** surface the competing
+  versions as siblings: a read always returns one document. When three or more copies are mutually
+  concurrent, they are folded in node-name order, so every replica picks the same winner.
+
+A **delete writes a tombstone**: the document file is kept, replaced by a marker (`_deleted: true`) that
+carries its own vector clock, rather than being removed. The tombstone replicates and read-repairs like
+any other write, and reads, listings and indexes treat the document as gone (a read by id answers
+"Document not found"). So a replica that missed a delete is **repaired to the tombstone** on the next
+read of that document, and the delete **cannot be undone** by a stale replica still holding the old copy.
+A replica that has no copy at all is repaired too, so it cannot later accept a late copy of a document
+that was already deleted. Read-repair never overwrites a replica's newer data: a replica applies a repair
+through the same causal rules as replication, so a repair that races a newer write or delete is ignored.
+For a replica whose copy already agrees, the content is left unchanged (on a concurrent conflict, only
+the merged vector clock is written back).
+
+To see this in the demo above, delete the document in step 3 instead of updating it. The stopped replica
+misses the delete, so after step 4 the read in step 5 answers "Document not found" and tombstones that
+replica, rather than letting it serve the deleted document.
+
+Tombstones are **not yet garbage-collected**, so they accumulate on disk, and vector clocks grow with the
+number of nodes that have written a document. No new environment variables are involved.
 
 > If the coordinator starts before the data nodes accept connections, its one-shot mesh wiring is
 > skipped. Re-run it once the nodes are up: `docker compose restart bootstrappingnode`.
