@@ -41,8 +41,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * Over real HTTP with Spring Security active: a three-member cluster of this node plus two stub peers
  * (JDK {@link HttpServer}s that record what they receive and answer reads as the test dictates). Every
- * schema is held by all three nodes. A client read by id asks every replica, returns the freshest copy
- * and writes it back to each replica that holds an older one, but never to a replica that has no copy.
+ * schema is held by all three nodes. A client read by id asks every replica, reconciles the copies by vector
+ * clock, returns the winner and writes it back to each replica whose copy differs, one with no copy included
+ * (a delete is a tombstone, so an absent copy was never deleted and is simply healed). See
+ * {@link ReadRepairVClockTest} for tombstones.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestPropertySource(properties = "app.jwt.secret=dev-secret-change-me-please-at-least-32-bytes-long-000")
@@ -161,10 +163,10 @@ class ReadRepairIntegrationTest {
     }
 
     @Test
-    void staleReplicaIsRepairedAndAReplicaWithNoCopyIsNot() throws IOException {
+    void staleReplicaIsRepairedAndAReplicaWithNoCopyIsHealed() throws IOException {
         writeLocal(doc(7, 3));
-        first.holds(doc(5, 1));      // stale: one version behind the winner
-        // second answers not-found: it must not be handed a document it never had
+        first.holds(doc(5, 1));      // stale: its clock is dominated by the winner's
+        // second answers not-found: it missed the document and is healed
 
         JSONObject read = new JSONObject(get().getBody());
 
@@ -180,8 +182,8 @@ class ReadRepairIntegrationTest {
                 .isEqualTo("/user/read/document?id=" + ID + "&databaseName=" + DB + "&schemaName=" + schema);
         assertThat(jwtService.role(bearerToken(first.reads().get(0)))).isEqualTo("INTERNAL");
 
-        // the stale replica was sent the winning document through the conditional repair endpoint (never the
-        // verbatim update, which would upsert), as an internal peer write
+        // the stale replica was sent the winning document through the internal repair endpoint, which reconciles
+        // it against the stored copy by clock (never the verbatim update), as an internal peer write
         assertThat(first.writes()).hasSize(1);
         Received repair = first.writes().get(0);
         assertThat(repair.uri())
@@ -191,8 +193,15 @@ class ReadRepairIntegrationTest {
         assertThat(repaired.getInt("_version")).isEqualTo(3);
         assertThat(repaired.getInt("n")).isEqualTo(7);
 
-        // the replica with no copy was left alone: no resurrection
-        assertThat(second.writes()).isEmpty();
+        // the replica with no copy is healed from the winner: it is sent the same document the same way
+        assertThat(second.writes()).hasSize(1);
+        Received heal = second.writes().get(0);
+        assertThat(heal.uri())
+                .isEqualTo("/write/document/repair?database=" + DB + "&schema=" + schema + "&id=" + ID);
+        assertThat(jwtService.role(bearerToken(heal))).isEqualTo("INTERNAL");
+        JSONObject healed = new JSONObject(heal.body());
+        assertThat(healed.getInt("_version")).isEqualTo(3);
+        assertThat(healed.getInt("n")).isEqualTo(7);
     }
 
     @Test
@@ -205,25 +214,31 @@ class ReadRepairIntegrationTest {
         assertThat(new JSONObject(read.getString("content")).getInt("_version")).isEqualTo(3);
         assertThat(new JSONObject(read.getString("content")).getInt("n")).isEqualTo(9);
 
-        // this node's own copy now matches the winner; the peer that already had it is not written to
+        // this node's own copy now matches the winner; the peer that already had it is not written to, while
+        // the peer with no copy is healed
         JSONObject local = new JSONObject(Files.readString(localDocument()));
         assertThat(local.getInt("_version")).isEqualTo(3);
         assertThat(local.getInt("n")).isEqualTo(9);
         assertThat(first.writes()).isEmpty();
-        assertThat(second.writes()).isEmpty();
+        assertThat(second.writes()).hasSize(1);
+        assertThat(new JSONObject(second.writes().get(0).body()).getInt("n")).isEqualTo(9);
     }
 
     @Test
-    void localReplicaWithNoCopyIsNotResurrected() {
-        // no local copy; one peer is stale-but-present, the other has nothing
+    void localReplicaWithNoCopyIsHealed() throws IOException {
+        // no local copy; one peer holds the document, the other has nothing. A delete leaves a tombstone, not
+        // an absent file, so an absent copy missed the document and is filled in rather than left empty
         first.holds(doc(4, 2));
 
         JSONObject read = new JSONObject(get().getBody());
 
         assertThat(new JSONObject(read.getString("content")).getInt("_version")).isEqualTo(2);
-        assertThat(Files.exists(localDocument())).isFalse();
+        JSONObject local = new JSONObject(Files.readString(localDocument()));
+        assertThat(local.getInt("_version")).isEqualTo(2);
+        assertThat(local.getInt("n")).isEqualTo(4);
         assertThat(first.writes()).isEmpty();
-        assertThat(second.writes()).isEmpty();
+        assertThat(second.writes()).hasSize(1);
+        assertThat(new JSONObject(second.writes().get(0).body()).getInt("n")).isEqualTo(4);
     }
 
     @Test
@@ -295,20 +310,20 @@ class ReadRepairIntegrationTest {
     }
 
     @Test
-    void internalRepairEndpointOnlyUpgradesAPresentOlderDocument() throws IOException {
+    void internalRepairEndpointAppliesTheDominatingCopyAndNeverRegresses() throws IOException {
         writeLocal(doc(1, 1));
 
         repairAsInternal(doc(9, 3));
         assertThat(new JSONObject(Files.readString(localDocument())).getInt("_version")).isEqualTo(3);
 
-        repairAsInternal(doc(4, 2));  // older than what is stored: must not regress it
+        repairAsInternal(doc(4, 2));  // dominated by what is stored: must not regress it
         JSONObject stored = new JSONObject(Files.readString(localDocument()));
         assertThat(stored.getInt("_version")).isEqualTo(3);
         assertThat(stored.getInt("n")).isEqualTo(9);
 
         Files.delete(localDocument());
-        repairAsInternal(doc(9, 5));  // the document is gone here: must not be recreated
-        assertThat(Files.exists(localDocument())).isFalse();
+        repairAsInternal(doc(9, 5));  // the replica has no copy: it is healed from the winner
+        assertThat(new JSONObject(Files.readString(localDocument())).getInt("_version")).isEqualTo(5);
     }
 
     @Test
@@ -362,8 +377,9 @@ class ReadRepairIntegrationTest {
         return "Bearer " + jwtService.generateServiceToken();
     }
 
+    /** A live document at {@code version}; its clock counts one event per version, all by the same writer. */
     private static String doc(int n, int version) {
-        return "{\"n\":" + n + ",\"_version\":" + version + "}";
+        return "{\"n\":" + n + ",\"_version\":" + version + ",\"_vclock\":{\"Node0\":" + version + "}}";
     }
 
     private Path localDocument() {

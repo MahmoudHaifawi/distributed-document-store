@@ -30,6 +30,20 @@ class ReadServiceTest {
     }
 
     @Test
+    void readingAllDocumentsOmitsTombstones(@org.junit.jupiter.api.io.TempDir Path dir) throws Exception {
+        Files.writeString(dir.resolve("0.json"), new JSONObject().put("Name", "A").toString());
+        Files.writeString(dir.resolve("1.json"), new JSONObject().put("_deleted", true).put("_version", 2)
+                .put("_vclock", new JSONObject().put("n1", 2)).toString());
+        Files.writeString(dir.resolve("2.json"), new JSONObject().put("Name", "C").put("_deleted", false).toString());
+
+        Response response = service.readDocumentsInDirectory(dir.toFile());
+
+        assertThat(response.getResponseType()).isEqualTo(ResponseType.SUCCESS);
+        JSONObject all = new JSONObject(response.getContent().toString());
+        assertThat(all.keySet()).containsExactlyInAnyOrder("0.json", "2.json");
+    }
+
+    @Test
     void concurrentReadsBothSucceed(@org.junit.jupiter.api.io.TempDir Path dir) throws Exception {
         Files.writeString(dir.resolve("0.json"), new JSONObject().put("Name", "A").toString());
         File folder = dir.toFile();

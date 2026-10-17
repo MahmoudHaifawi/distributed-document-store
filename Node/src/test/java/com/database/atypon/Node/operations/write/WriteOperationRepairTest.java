@@ -20,9 +20,10 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 
 /**
- * Read-repair writes the freshest copy of a document onto a replica that holds an older one. Unlike the
- * verbatim {@code applyUpdate}, it must be conditional: it may only upgrade a document that is still there
- * and still older, so a repair racing a delete or a newer write can neither resurrect nor regress anything.
+ * Read-repair hands a replica the winning copy of a document, and the replica applies it through the same
+ * causal reconcile as replication ({@code applyReplicated}). So it is neither a blind overwrite nor a
+ * version compare: a winner that descends the stored copy is stored, a tombstone winner tombstones a copy it
+ * dominates, an absent copy is healed, and a winner the stored copy already dominates is left alone.
  */
 class WriteOperationRepairTest {
 
@@ -51,12 +52,19 @@ class WriteOperationRepairTest {
         }
     }
 
-    private void store(int age, int version) throws Exception {
-        Files.writeString(records.resolve("0.json"), doc(age, version).toString());
+    /** A live document at {@code version} whose clock is the single entry {@code node:version}. */
+    private static JSONObject doc(int age, int version, String node, long ts) {
+        return new JSONObject().put("Age", age).put("_version", version)
+                .put("_vclock", new JSONObject().put(node, version)).put("_ts", ts);
     }
 
-    private static JSONObject doc(int age, int version) {
-        return new JSONObject().put("Age", age).put("_version", version);
+    private static JSONObject tombstone(int version, String node, long ts) {
+        return new JSONObject().put("_deleted", true).put("_version", version)
+                .put("_vclock", new JSONObject().put(node, version)).put("_ts", ts);
+    }
+
+    private void store(JSONObject doc) throws Exception {
+        Files.writeString(records.resolve("0.json"), doc.toString());
     }
 
     private JSONObject stored() throws Exception {
@@ -64,46 +72,74 @@ class WriteOperationRepairTest {
     }
 
     @Test
-    void repairUpgradesAPresentOlderDocument() throws Exception {
-        store(10, 1);
+    void repairUpgradesADocumentTheWinnerDescends() throws Exception {
+        store(doc(10, 1, "n1", 1_000));
 
-        var resp = writeOp.repairDocument("repairdb", "users", "0", doc(30, 3));
+        var resp = writeOp.repairDocument("repairdb", "users", "0", doc(30, 3, "n1", 3_000));
 
         assertThat(resp.getResponseType()).isEqualTo(ResponseType.SUCCESS);
         assertThat(resp.getContent()).isEqualTo(true); // applied
         assertThat(stored().getInt("Age")).isEqualTo(30);
         assertThat(stored().getInt("_version")).isEqualTo(3); // taken from the winner, not incremented
+        assertThat(stored().getJSONObject("_vclock").getInt("n1")).isEqualTo(3);
         verify(indexManagerMock).onUpdate(eq("repairdb"), eq("users"), eq(0), any(), any());
     }
 
     @Test
-    void repairNeverCreatesADocumentThatIsAbsent() throws Exception {
-        // the document was deleted (or never copied) here: repairing it would bring it back from the dead
-        var resp = writeOp.repairDocument("repairdb", "users", "0", doc(30, 3));
+    void repairHealsADocumentThatIsAbsent() throws Exception {
+        // the replica missed the create: with deletes recorded as tombstones, an absent file was never deleted
+        var resp = writeOp.repairDocument("repairdb", "users", "0", doc(30, 3, "n1", 3_000));
 
         assertThat(resp.getResponseType()).isEqualTo(ResponseType.SUCCESS);
-        assertThat(resp.getContent()).isEqualTo(false); // skipped
-        assertThat(Files.exists(records.resolve("0.json"))).isFalse();
+        assertThat(resp.getContent()).isEqualTo(true);
+        assertThat(stored().getInt("Age")).isEqualTo(30);
+        assertThat(stored().getInt("_version")).isEqualTo(3);
+        verify(indexManagerMock).onUpdate(eq("repairdb"), eq("users"), eq(0), any(), any());
+    }
+
+    @Test
+    void aTombstoneWinnerTombstonesTheLiveCopyItDominates() throws Exception {
+        store(doc(10, 1, "n1", 1_000));
+
+        var resp = writeOp.repairDocument("repairdb", "users", "0", tombstone(2, "n1", 2_000));
+
+        assertThat(resp.getResponseType()).isEqualTo(ResponseType.SUCCESS);
+        assertThat(resp.getContent()).isEqualTo(true);
+        assertThat(stored().getBoolean("_deleted")).isTrue();
+        assertThat(stored().has("Age")).isFalse();
+        assertThat(stored().getInt("_version")).isEqualTo(2);
+        verify(indexManagerMock).onDelete(eq("repairdb"), eq("users"), eq(0), any());
         verify(indexManagerMock, never()).onUpdate(any(), any(), anyInt(), any(), any());
     }
 
     @Test
-    void repairNeverOverwritesADocumentAtTheSameVersion() throws Exception {
-        store(10, 3);
+    void aTombstoneWinnerIsStoredOnAReplicaThatNeverHeldTheDocumentWithoutSchemaValidation() throws Exception {
+        // a tombstone carries none of the schema's fields, so validating it would reject every delete
+        var resp = writeOp.repairDocument("repairdb", "users", "0", tombstone(2, "n1", 2_000));
 
-        var resp = writeOp.repairDocument("repairdb", "users", "0", doc(30, 3));
+        assertThat(resp.getResponseType()).isEqualTo(ResponseType.SUCCESS);
+        assertThat(resp.getContent()).isEqualTo(true);
+        assertThat(stored().getBoolean("_deleted")).isTrue();
+    }
 
-        assertThat(resp.getContent()).isEqualTo(false);
+    @Test
+    void repairNeverOverwritesADocumentWithTheSameClock() throws Exception {
+        store(doc(10, 3, "n1", 3_000));
+
+        var resp = writeOp.repairDocument("repairdb", "users", "0", doc(30, 3, "n1", 3_000));
+
+        assertThat(resp.getResponseType()).isEqualTo(ResponseType.SUCCESS);
+        assertThat(resp.getContent()).isEqualTo(false); // skipped: nothing to change
         assertThat(stored().getInt("Age")).isEqualTo(10);
         assertThat(stored().getInt("_version")).isEqualTo(3);
         verify(indexManagerMock, never()).onUpdate(any(), any(), anyInt(), any(), any());
     }
 
     @Test
-    void repairNeverRegressesADocumentThatIsNewerThanTheWinner() throws Exception {
-        store(99, 4); // a newer write landed here after the read gathered its copies
+    void repairNeverRegressesADocumentThatDominatesTheWinner() throws Exception {
+        store(doc(99, 4, "n1", 4_000)); // a newer write landed here after the read gathered its copies
 
-        var resp = writeOp.repairDocument("repairdb", "users", "0", doc(30, 3));
+        var resp = writeOp.repairDocument("repairdb", "users", "0", doc(30, 3, "n1", 3_000));
 
         assertThat(resp.getResponseType()).isEqualTo(ResponseType.SUCCESS);
         assertThat(resp.getContent()).isEqualTo(false);
@@ -113,24 +149,39 @@ class WriteOperationRepairTest {
     }
 
     @Test
-    void aStoredDocumentWithNoVersionCountsAsVersionOne() throws Exception {
-        Files.writeString(records.resolve("0.json"), new JSONObject().put("Age", 10).toString());
+    void aStaleTombstoneCannotDeleteALiveCopyThatSupersedesIt() throws Exception {
+        store(doc(99, 4, "n1", 4_000)); // re-created / updated after the delete the winner records
 
-        var resp = writeOp.repairDocument("repairdb", "users", "0", doc(30, 2));
+        var resp = writeOp.repairDocument("repairdb", "users", "0", tombstone(2, "n1", 2_000));
 
-        assertThat(resp.getContent()).isEqualTo(true);
-        assertThat(stored().getInt("_version")).isEqualTo(2);
+        assertThat(resp.getContent()).isEqualTo(false);
+        assertThat(stored().optBoolean("_deleted", false)).isFalse();
+        assertThat(stored().getInt("Age")).isEqualTo(99);
+        verify(indexManagerMock, never()).onDelete(any(), any(), anyInt(), any());
     }
 
     @Test
-    void repairFailingValidationDoesNotWrite() throws Exception {
-        store(10, 1);
+    void aConcurrentLosingWinnerLeavesTheStoredContentAndOnlyMergesTheClock() throws Exception {
+        store(doc(10, 1, "n1", 9_000));  // the later of two concurrent writes
 
-        var resp = writeOp.repairDocument("repairdb", "users", "0",
-                new JSONObject().put("Age", "notAnInt").put("_version", 3));
+        var resp = writeOp.repairDocument("repairdb", "users", "0", doc(30, 1, "n2", 1_000));
 
-        assertThat(resp.getResponseType()).isEqualTo(ResponseType.ERROR);
+        assertThat(resp.getResponseType()).isEqualTo(ResponseType.SUCCESS);
         assertThat(stored().getInt("Age")).isEqualTo(10);
-        assertThat(stored().getInt("_version")).isEqualTo(1);
+        assertThat(stored().optBoolean("_deleted", false)).isFalse();
+        // the copy now records that it has seen the loser, so the loser can never read as unseen again
+        assertThat(stored().getJSONObject("_vclock").getInt("n1")).isEqualTo(1);
+        assertThat(stored().getJSONObject("_vclock").getInt("n2")).isEqualTo(1);
+    }
+
+    @Test
+    void aStoredDocumentWithNoClockIsUpgradedByAWinnerWithOne() throws Exception {
+        Files.writeString(records.resolve("0.json"), new JSONObject().put("Age", 10).toString());
+
+        var resp = writeOp.repairDocument("repairdb", "users", "0", doc(30, 2, "n1", 2_000));
+
+        assertThat(resp.getContent()).isEqualTo(true);
+        assertThat(stored().getInt("Age")).isEqualTo(30);
+        assertThat(stored().getInt("_version")).isEqualTo(2);
     }
 }

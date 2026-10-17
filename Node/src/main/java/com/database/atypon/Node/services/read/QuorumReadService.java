@@ -4,14 +4,13 @@ import com.database.atypon.Node.model.Network;
 import com.database.atypon.Node.model.Node;
 import com.database.atypon.Node.security.ServiceTokens;
 import com.database.atypon.Node.services.write.WriteService;
-import com.database.atypon.Node.utils.JsonKeys;
 import com.database.atypon.Node.utils.concurrent.Broadcaster;
 import com.database.atypon.Node.utils.quorum.ConsistencyConfig;
 import com.database.atypon.Node.utils.quorum.Quorum;
-import com.database.atypon.Node.utils.quorum.ReplicaDoc;
 import com.database.atypon.Node.utils.response.Response;
 import com.database.atypon.Node.utils.response.ResponseType;
 import com.database.atypon.Node.utils.ring.RingRouter;
+import com.database.atypon.Node.utils.vclock.Reconcile;
 import org.json.JSONException;
 import org.json.JSONObject;
 import org.springframework.http.HttpEntity;
@@ -30,20 +29,22 @@ import java.util.Map;
 import java.util.function.Supplier;
 
 /**
- * Reads a document by id from every replica of its schema, answers with the freshest copy and writes that
- * copy back to every replica that holds an older one (last-write-wins read-repair).
+ * Reads a document by id from every replica of its schema, reconciles the copies by vector clock, answers
+ * with the winner and writes that winner back to every replica whose copy differs from it (read-repair).
  *
  * <p>Asking all replicas, rather than only the {@code R} that the read consistency requires, means the
  * answers always overlap the {@code W} replicas that acknowledged the latest write. So read-your-writes
- * ({@code W + R > N}) holds for document creates and updates: the freshest acknowledged version is seen.
- * {@code R} then only says how many replicas should have answered: fewer is a degraded read, which is
- * still served from whatever was found.
+ * ({@code W + R > N}) holds for document creates, updates and deletes: the latest acknowledged write is
+ * among the copies reconciled. {@code R} then only says how many replicas should have answered: fewer is a
+ * degraded read, which is still served from whatever was found.
  *
- * <p>Deletes are not reconciled. There are no tombstones yet, so a replica that missed a delete can still
- * return the document. Read-repair only upgrades an older copy that is still present: a replica that
- * answers "not found" is not written to, and the repair itself only upgrades a document that is still
- * present (and older) on the replica when it is applied, rather than upserting it, so it never re-creates
- * a missing document. This applies to read-by-id only.
+ * <p>A delete is a tombstone, a copy like any other, so it takes part in the reconcile by its clock. When the
+ * winner is a tombstone the client is told "Document not found", and the tombstone is repaired onto the
+ * replicas still holding the live document, so a replica that missed a delete stops resurrecting it. A
+ * replica with no copy at all is healed from the winner: since a delete leaves a tombstone, not an absent
+ * file, an absent copy only ever missed a write. Each replica applies the winner through the same causal
+ * apply as replication, which re-checks under its own write lock, so a newer write or a delete that lands
+ * after the gather is not undone. This applies to read-by-id only.
  */
 @Service
 public class QuorumReadService {
@@ -55,6 +56,10 @@ public class QuorumReadService {
     private static final int READ_TIMEOUT_MILLIS = 5_000;
     private static final RestTemplate REST = restTemplate();
 
+    /** One replica's answer: the node, and its stored document (live or tombstone), or null when it has none. */
+    private record Copy(String node, JSONObject doc) {
+    }
+
     private final ReadService readService;
     private final WriteService writeService;
 
@@ -64,8 +69,9 @@ public class QuorumReadService {
     }
 
     /**
-     * The freshest copy of the document held by any reachable replica, or an ERROR "Document not found"
-     * when none holds it. Replicas holding an older copy are repaired before this returns.
+     * The winner of the copies held by the reachable replicas, reconciled by vector clock: the document
+     * itself, or an ERROR "Document not found" when no replica holds it or the winner is a tombstone.
+     * Replicas whose copy differs from the winner are repaired before this returns.
      */
     public Response readById(String db, String schema, String id) {
         int replicas = RingRouter.replicasFor(db, schema).size();
@@ -76,9 +82,11 @@ public class QuorumReadService {
             peers.put(peer.getName(), peer);
         }
 
-        ReplicaDoc local = localCopy(db, schema, id);
-        List<ReplicaDoc> gathered = new ArrayList<>();
-        gathered.add(local);
+        Copy local = localCopy(db, schema, id);
+        List<Copy> gathered = new ArrayList<>();
+        if (local != null) {
+            gathered.add(local);
+        }
         gathered.addAll(peerCopies(peers.values(), db, schema, id));
 
         if (gathered.size() < required) {
@@ -86,26 +94,37 @@ public class QuorumReadService {
                     db, schema, id, gathered.size(), replicas, required);
         }
 
-        ReplicaDoc winner = Quorum.pickFreshest(gathered);
+        JSONObject winner = null; // an absent copy (a null doc) never wins against a present one
+        for (Copy copy : gathered) {
+            winner = Reconcile.winner(winner, copy.doc());
+        }
         if (winner == null) {
             return new Response(ResponseType.ERROR, "Document not found");
         }
 
         repair(winner, local, gathered, peers, db, schema, id);
-        return new Response(ResponseType.SUCCESS, "Document fetched successfully", winner.content);
+        if (Reconcile.isTombstone(winner)) {
+            return new Response(ResponseType.ERROR, "Document not found");
+        }
+        return new Response(ResponseType.SUCCESS, "Document fetched successfully", winner.toString());
     }
 
-    private ReplicaDoc localCopy(String db, String schema, String id) {
+    /**
+     * This node's own copy: the raw stored document, a tombstone included. A document that is not there is
+     * an absent copy; one that is there but cannot be parsed is no usable answer, so it is left out (null).
+     */
+    private Copy localCopy(String db, String schema, String id) {
         String self = Network.self == null ? "self" : Network.self.getName();
         Response local = readService.fetchById(id, db, schema);
         if (local.getResponseType() == ResponseType.SUCCESS && local.getContent() instanceof String content) {
-            return new ReplicaDoc(self, true, versionOf(content), content);
+            JSONObject doc = parse(content);
+            return doc == null ? null : new Copy(self, doc);
         }
-        return new ReplicaDoc(self, false, 0, null);
+        return new Copy(self, null);
     }
 
     /** What each reachable peer answered; a peer that cannot be reached is left out. */
-    private List<ReplicaDoc> peerCopies(Iterable<Node> peers, String db, String schema, String id) {
+    private List<Copy> peerCopies(Iterable<Node> peers, String db, String schema, String id) {
         List<Node> asked = new ArrayList<>();
         List<Supplier<Response>> tasks = new ArrayList<>();
         for (Node peer : peers) {
@@ -114,7 +133,7 @@ public class QuorumReadService {
         }
         List<Response> answers = Broadcaster.broadcast(tasks);
 
-        List<ReplicaDoc> copies = new ArrayList<>();
+        List<Copy> copies = new ArrayList<>();
         for (int i = 0; i < asked.size(); i++) {
             Response answer = answers.get(i);
             if (answer == null) {
@@ -122,9 +141,12 @@ public class QuorumReadService {
             }
             Node peer = asked.get(i);
             if (answer.getResponseType() == ResponseType.SUCCESS && answer.getContent() instanceof String content) {
-                copies.add(new ReplicaDoc(peer.getName(), true, versionOf(content), content));
+                JSONObject doc = parse(content);
+                if (doc != null) {
+                    copies.add(new Copy(peer.getName(), doc));
+                }
             } else {
-                copies.add(new ReplicaDoc(peer.getName(), false, 0, null));
+                copies.add(new Copy(peer.getName(), null));
             }
         }
         return copies;
@@ -153,27 +175,30 @@ public class QuorumReadService {
     }
 
     /**
-     * Offers the winning document to every replica that held an older copy of it. Best effort. Each replica
-     * applies it through the conditional repair, which re-checks under its own write lock that the document
-     * is still there and still older, so a delete or a newer write that lands after the gather is not undone.
+     * Offers the winner to every replica whose copy differs from it by content, a replica with no copy
+     * included. Best effort, and safe to over-send: a replica applies it through the causal apply, which
+     * stores it only when that changes the replica's copy.
      */
-    private void repair(ReplicaDoc winner, ReplicaDoc local, List<ReplicaDoc> gathered, Map<String, Node> peers,
+    private void repair(JSONObject winner, Copy local, List<Copy> gathered, Map<String, Node> peers,
                         String db, String schema, String id) {
         List<Supplier<Response>> repairs = new ArrayList<>();
-        for (ReplicaDoc copy : Quorum.staleTargets(gathered, winner)) {
+        for (Copy copy : gathered) {
+            if (copy.doc() != null && copy.doc().similar(winner)) {
+                continue; // already the winner
+            }
             if (copy == local) {
                 repairs.add(() -> repairLocal(winner, db, schema, id));
             } else {
-                Node peer = peers.get(copy.node);
+                Node peer = peers.get(copy.node());
                 repairs.add(() -> repairPeer(peer, winner, db, schema, id));
             }
         }
         Broadcaster.broadcast(repairs);
     }
 
-    private Response repairLocal(ReplicaDoc winner, String db, String schema, String id) {
+    private Response repairLocal(JSONObject winner, String db, String schema, String id) {
         try {
-            HashMap<String, Object> document = new HashMap<>(new JSONObject(winner.content).toMap());
+            HashMap<String, Object> document = new HashMap<>(winner.toMap());
             Response result = writeService.repairDocument(db, schema, id, document);
             if (result.getResponseType() != ResponseType.SUCCESS) {
                 log.warn("read-repair of {}.{}/{} here failed: {}", db, schema, id, result.getMessage());
@@ -185,14 +210,14 @@ public class QuorumReadService {
         }
     }
 
-    private Response repairPeer(Node peer, ReplicaDoc winner, String db, String schema, String id) {
+    private Response repairPeer(Node peer, JSONObject winner, String db, String schema, String id) {
         try {
             HttpHeaders headers = new HttpHeaders();
             headers.set("Authorization", ServiceTokens.bearer());
             headers.setContentType(MediaType.APPLICATION_JSON);
             REST.exchange(
                     peer.getURL() + "/write/document/repair?database={db}&schema={schema}&id={id}",
-                    HttpMethod.POST, new HttpEntity<>(winner.content, headers), String.class, db, schema, id);
+                    HttpMethod.POST, new HttpEntity<>(winner.toString(), headers), String.class, db, schema, id);
             return new Response(ResponseType.SUCCESS, "Replica repaired");
         } catch (Exception e) {
             log.warn("read-repair of {}.{}/{} on {} failed: {}", db, schema, id, peer.getName(), e.getMessage());
@@ -200,12 +225,12 @@ public class QuorumReadService {
         }
     }
 
-    /** The {@code _version} stamped on a stored document; a document that carries none is at version 1. */
-    private static int versionOf(String content) {
+    /** The document in {@code content}, or null when it is not a JSON object. */
+    private static JSONObject parse(String content) {
         try {
-            return new JSONObject(content).optInt(JsonKeys.VERSION, 1);
+            return new JSONObject(content);
         } catch (JSONException e) {
-            return 1;
+            return null;
         }
     }
 

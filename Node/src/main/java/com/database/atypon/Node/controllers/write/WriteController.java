@@ -118,12 +118,13 @@ public class WriteController {
     }
 
     /**
-     * Read-repair, called by a peer that read a fresher copy of the document than the one here. For internal
-     * callers only: the URL rule in SecurityConfig is the first guard, and the handler checks the role itself
-     * so that no variant of the URL that slips past that rule (such as one with a trailing slash) can let a
-     * client overwrite a document, bypassing primary routing, versioning and replication. It upgrades a
-     * present, older document and does nothing otherwise, so unlike {@code /document/update} it can never
-     * recreate a deleted document.
+     * Read-repair, called by a peer that reconciled the replicas' copies of a document and found the one
+     * here differs from the winner (a live document or a tombstone). For internal callers only: the URL rule
+     * in SecurityConfig is the first guard, and the handler checks the role itself so that no variant of the
+     * URL that slips past that rule (such as one with a trailing slash) can let a client overwrite a
+     * document, bypassing primary routing, versioning and replication. The winner is applied causally, like
+     * a replicated write: it replaces a copy it descends or heals an absent one, a tombstone winner deletes
+     * a live copy it dominates, and a copy that already dominates the winner is left alone.
      */
     @PostMapping(value = "/document/repair", produces = "application/json")
     public Vector<Response> repairDocument(@RequestParam String database,
