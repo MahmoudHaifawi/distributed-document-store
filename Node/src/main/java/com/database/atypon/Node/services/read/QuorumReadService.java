@@ -22,6 +22,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -57,7 +58,7 @@ public class QuorumReadService {
     private static final RestTemplate REST = restTemplate();
 
     /** One replica's answer: the node, and its stored document (live or tombstone), or null when it has none. */
-    private record Copy(String node, JSONObject doc) {
+    record Copy(String node, JSONObject doc) {
     }
 
     private final ReadService readService;
@@ -94,10 +95,7 @@ public class QuorumReadService {
                     db, schema, id, gathered.size(), replicas, required);
         }
 
-        JSONObject winner = null; // an absent copy (a null doc) never wins against a present one
-        for (Copy copy : gathered) {
-            winner = Reconcile.winner(winner, copy.doc());
-        }
+        JSONObject winner = winnerOf(gathered);
         if (winner == null) {
             return new Response(ResponseType.ERROR, "Document not found");
         }
@@ -107,6 +105,26 @@ public class QuorumReadService {
             return new Response(ResponseType.ERROR, "Document not found");
         }
         return new Response(ResponseType.SUCCESS, "Document fetched successfully", winner.toString());
+    }
+
+    /**
+     * Folds {@link Reconcile#winner} across the copies, or null when none holds a document (an absent copy,
+     * a null doc, never wins against a present one).
+     *
+     * <p>{@code Reconcile.winner} is not commutative over three or more mutually concurrent copies: it hands
+     * back the winner with the merged clock, which can then cover a later copy and shield it from losing on
+     * timestamp. So the result of a fold depends on its order. The copies are therefore folded in order of
+     * their source node's name, each copy coming from a distinct node, which makes the winner depend only on
+     * the copies held and not on how they were gathered, and so identical on every replica that repairs.
+     */
+    static JSONObject winnerOf(List<Copy> copies) {
+        List<Copy> byNode = new ArrayList<>(copies);
+        byNode.sort(Comparator.comparing(Copy::node, Comparator.nullsFirst(Comparator.naturalOrder())));
+        JSONObject winner = null;
+        for (Copy copy : byNode) {
+            winner = Reconcile.winner(winner, copy.doc());
+        }
+        return winner;
     }
 
     /**
