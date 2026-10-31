@@ -29,6 +29,12 @@ class GatewayRoleTest {
     }
 
     @Test
+    void gatewayRunsNoTimers() {
+        // scheduling is enabled for the node role alone (it drives the SWIM detector)
+        assertThat(ctx.getBeanNamesForType(org.springframework.scheduling.annotation.ScheduledAnnotationBeanPostProcessor.class)).isEmpty();
+    }
+
+    @Test
     void loginPageRendersFromTemplatesOnTheClasspath() throws Exception {
         mvc.perform(get("/login")).andExpect(status().isOk());
     }

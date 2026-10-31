@@ -16,6 +16,7 @@ public final class SwimConfig {
     private static final String GOSSIP_ENABLED_ENV = "GOSSIP_ENABLED";
     private static final String SEED_NODES_ENV = "SEED_NODES";
     private static final String CLUSTER_NODES_ENV = "CLUSTER_NODES";
+    private static final String NODE_NAME_ENV = "NODE_NAME";
     private static final String PERIOD_MS_ENV = "SWIM_PERIOD_MS";
     private static final String PING_TIMEOUT_MS_ENV = "SWIM_PING_TIMEOUT_MS";
     private static final String INDIRECT_K_ENV = "SWIM_INDIRECT_K";
@@ -56,6 +57,16 @@ public final class SwimConfig {
             return Collections.emptyList();
         }
         return parseNodes(raw);
+    }
+
+    /**
+     * The name this node goes by in the cluster: {@code NODE_NAME}, or {@code null} when it is unset or
+     * blank (the caller then falls back to an identity it was assigned, or to the host name). It must be
+     * spelled the way the other nodes reach this one, as in {@code SEED_NODES} / {@code CLUSTER_NODES}.
+     */
+    public static String nodeName() {
+        String raw = env.apply(NODE_NAME_ENV);
+        return (raw == null || raw.isBlank()) ? null : raw.trim();
     }
 
     /** Probe interval {@code T}: {@code SWIM_PERIOD_MS}, default 1000. */

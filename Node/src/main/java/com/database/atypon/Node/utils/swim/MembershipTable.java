@@ -199,6 +199,40 @@ public class MembershipTable {
     }
 
     /**
+     * The gossip for an answer to a probe from {@code sender}: {@link #outgoingGossip(int)} plus, when
+     * this node currently holds the sender as {@code DEAD} or {@code SUSPECT}, that belief itself, whatever
+     * is left of its retransmit budget. At most {@code max} updates in all, the belief first in line for a slot.
+     *
+     * <p>This is what lets a partition re-merge. A node written off while it was cut off is not probed by
+     * anyone, and the news that it was written off stops being gossiped after a handful of sends, so it
+     * would never learn it. But a node that is written off and still talking is, by definition, one that
+     * can reach us: when it does, we tell it. Told it is {@code DEAD} or {@code SUSPECT} at incarnation
+     * {@code i}, it refutes with {@code ALIVE} at {@code i + 1} (see {@link #merge(Member)}), which every
+     * message of its then carries, and we take it back.
+     *
+     * <p>{@code LEFT} is deliberately not reported: the sender departed on purpose, and telling a departing
+     * node it has left would only make it refute that and undo its own leave. An {@code ALIVE} or unknown
+     * sender has no belief to correct.
+     */
+    public List<MemberUpdate> replyGossip(int max, String sender) {
+        synchronized (lock) {
+            if (max <= 0) {
+                return new ArrayList<>();
+            }
+            Member belief = (sender == null || sender.equals(selfName)) ? null : members.get(sender);
+            boolean correct = belief != null
+                    && (belief.getState() == MemberState.DEAD || belief.getState() == MemberState.SUSPECT);
+            if (!correct) {
+                return outgoingGossip(max);
+            }
+            List<MemberUpdate> wire = max > 1 ? outgoingGossip(max - 1) : new ArrayList<>();
+            wire.removeIf(update -> sender.equals(update.getName())); // the belief below supersedes any older word of it
+            wire.add(MemberUpdate.from(belief));
+            return wire;
+        }
+    }
+
+    /**
      * Applies the gossip of one inbound message, update by update, through {@link #merge(Member)}; every
      * update that changed this table is thereby queued to be passed on, and one that changed nothing is
      * not, which is what stops gossip from circulating forever. The whole message is applied as one

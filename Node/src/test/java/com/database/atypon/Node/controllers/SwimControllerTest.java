@@ -178,6 +178,64 @@ class SwimControllerTest {
         assertThat(found).as("the ack carries the update it just learnt: %s", gossip).isTrue();
     }
 
+    // The joiners and leavers below are tombstones (DEAD / LEFT) of members nobody has, under names of their
+    // own: they enter the shared table but never its live set, so the ring other tests rely on is untouched.
+
+    @Test
+    void joinAndLeaveAreForInternalCallersOnly() {
+        String member = "{\"name\":\"refused-ghost\",\"port\":\"9\",\"state\":\"DEAD\",\"incarnation\":1}";
+
+        for (String path : List.of("/swim/join", "/swim/leave")) {
+            assertThat(post(path, bearer("USER"), member).getStatusCode()).as(path).isEqualTo(HttpStatus.FORBIDDEN);
+            assertThat(post(path, bearer("ADMIN"), member).getStatusCode()).as(path).isEqualTo(HttpStatus.FORBIDDEN);
+            assertThat(post(path, null, member).getStatusCode().is4xxClientError()).as(path).isTrue();
+        }
+        assertThat(membership.get("refused-ghost")).as("a refused caller changes nothing").isNull();
+    }
+
+    @Test
+    void joinMergesTheJoinerAndAnswersWithTheMemberList() {
+        ResponseEntity<String> response = post("/swim/join", bearer("INTERNAL"),
+                "{\"name\":\"joiner-ghost\",\"port\":\"9\",\"state\":\"DEAD\",\"incarnation\":3}");
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(membership.get("joiner-ghost").getState()).isEqualTo(MemberState.DEAD);
+        JSONArray view = new JSONArray(response.getBody());
+        boolean found = false;
+        for (int i = 0; i < view.length(); i++) {
+            JSONObject member = view.getJSONObject(i);
+            if (member.getString("name").equals("joiner-ghost")) {
+                found = true;
+                assertThat(member.getString("state")).isEqualTo("DEAD");
+                assertThat(member.getInt("incarnation")).isEqualTo(3);
+                assertThat(member.getString("port")).isEqualTo("9");
+            }
+        }
+        assertThat(found).as("the answer is the whole table, the joiner included: %s", view).isTrue();
+    }
+
+    @Test
+    void leaveRecordsTheNamedNodeAsLeftWhateverStateTheBodyClaims() {
+        ResponseEntity<String> response = post("/swim/leave", bearer("INTERNAL"),
+                "{\"name\":\"leaver-ghost\",\"port\":\"9\",\"incarnation\":2}");
+
+        assertThat(acked(response)).isTrue();
+        Member leaver = membership.get("leaver-ghost");
+        assertThat(leaver.getState()).isEqualTo(MemberState.LEFT);
+        assertThat(leaver.getIncarnation()).isEqualTo(2);
+        assertThat(new JSONObject(response.getBody()).getJSONArray("gossip").length())
+                .as("the leaver is going: it is not handed gossip it would not merge").isZero();
+    }
+
+    @Test
+    void joinAndLeaveWithoutANamedMemberAreBadRequests() {
+        assertThat(post("/swim/join", bearer("INTERNAL"), "{}").getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(post("/swim/join", bearer("INTERNAL"), "").getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(post("/swim/leave", bearer("INTERNAL"), "{\"name\":\"nameless-port\"}").getStatusCode())
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(membership.get("nameless-port")).isNull();
+    }
+
     @Test
     void gossipWithAnUnknownStateIsABadRequest() {
         String ping = "{\"from\":\"NodeX\",\"gossip\":[{\"name\":\"g\",\"port\":\"9\",\"state\":\"BOGUS\",\"incarnation\":1}]}";

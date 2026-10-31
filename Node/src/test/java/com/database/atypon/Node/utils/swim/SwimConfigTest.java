@@ -137,6 +137,17 @@ class SwimConfigTest {
     }
 
     @Test
+    void nodeNameIsTheTrimmedEnvValueOrNullWhenUnsetOrBlank() {
+        assertThat(SwimConfig.nodeName()).isNull();
+
+        fakeEnv.put("NODE_NAME", "   ");
+        assertThat(SwimConfig.nodeName()).isNull();
+
+        fakeEnv.put("NODE_NAME", " Node3 ");
+        assertThat(SwimConfig.nodeName()).isEqualTo("Node3");
+    }
+
+    @Test
     void memberStatePrecedenceOrdersAliveBelowSuspectBelowDeadAndLeft() {
         assertThat(MemberState.ALIVE.precedence()).isEqualTo(0);
         assertThat(MemberState.SUSPECT.precedence()).isEqualTo(1);
