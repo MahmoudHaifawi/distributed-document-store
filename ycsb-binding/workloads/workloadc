@@ -1,0 +1,20 @@
+# Workload C: read only, 100% read, zipfian.
+# Standard YCSB CoreWorkload. A record is 10 String fields of 100 bytes plus the binding's ykey; an update
+# rewrites ONE field. recordcount / operationcount are deliberately small and are overridden on the command
+# line (-p recordcount=.. -p operationcount=..). See BENCHMARKS.md.
+workload=site.ycsb.workloads.CoreWorkload
+recordcount=1000
+operationcount=2000
+fieldcount=10
+fieldlength=100
+readallfields=true
+writeallfields=false
+requestdistribution=zipfian
+insertproportion=0
+scanproportion=0
+# HdrHistogram reports microsecond percentiles; the default histogram only resolves whole milliseconds.
+measurementtype=hdrhistogram
+hdrhistogram.percentiles=50,95,99,99.9
+readproportion=1
+updateproportion=0
+readmodifywriteproportion=0

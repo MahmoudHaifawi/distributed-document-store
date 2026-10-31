@@ -288,3 +288,31 @@ which holds that file. Defaults target a single local node (`CLUSTER_NODES=local
    disk-paged B+-tree via a sorted bulk-load of the records.
 4. **Query Index** — equality / range (`GT`, `GTE`, `LT`, `LTE`, `BETWEEN`) with `ASC`/`DESC` ordering
    and `limit`/`offset` pagination. Matching documents are resolved and shown in result order.
+
+---
+
+## Observability & benchmarking
+
+**Metrics.** Every role (`node`, `coordinator`, `gateway`) serves Prometheus metrics at `/actuator/prometheus`
+(public, no token; Actuator exposes only `health` and `prometheus`). Besides the usual JVM and HTTP timings
+there are application meters for writes, reads, read-repair, reconcile outcomes, tombstones, the ring size, SWIM
+membership / probes / gossip and state handoff (`db_*`); every meter is tagged with `role` and `node`. On a
+local single node: `curl -s localhost:8080/actuator/prometheus`.
+
+**Prometheus and Grafana (Docker).** `docker compose up --build` also starts both. Neither is needed by the
+database.
+
+| Service    | URL                       | Notes                                                                                     |
+|------------|---------------------------|-------------------------------------------------------------------------------------------|
+| Prometheus | http://localhost:9090     | scrapes all seven processes every 10 s (`monitoring/prometheus.yml`)                       |
+| Grafana    | http://localhost:3000     | dashboard **NoSQL Cluster** opens with no login; sign in as `admin` / `admin` (demo default) to edit |
+
+The dashboard is provisioned from `monitoring/grafana/`. Read it with the caveats in
+[BENCHMARKS.md, section 5](BENCHMARKS.md#5-reading-the-dashboard-correctly) (per-node counters, "conflicts" means
+concurrent writes only, `db_ring_size` for the node count).
+
+**Benchmarking.** [BENCHMARKS.md](BENCHMARKS.md) describes the YCSB binding (`ycsb-binding/`, workloads A, B, C
+and F in `ycsb-binding/workloads/`), how to run the load and run phases against one node or the Docker cluster,
+the measured single-node results, and a demo sequence (load, kill a node, watch SWIM / ring / read-repair,
+add a node, watch handoff). The multi-node run and the dashboard were not executed where that file was
+written (no Docker daemon); the file says exactly what was measured and what was not.
