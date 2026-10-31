@@ -13,6 +13,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.LongSupplier;
 
 /**
@@ -37,14 +38,28 @@ import java.util.function.LongSupplier;
  * concurrent updates cannot reorder their effects on {@link Network}. {@link Network} never calls
  * back into this class, so the lock order is always table then network.
  *
+ * <p>A change to the live set is also announced to the {@linkplain #addChangeListener registered listeners}
+ * (the state handoff is the one that listens), but only once the call that caused it has released the lock
+ * and the new ring is in place, so a listener is free to use the table and the ring. A listener still runs
+ * on the thread that made the change, which is usually the failure detector or a gossip handler: it must
+ * return quickly and hand any real work to another thread.
+ *
  * <p>{@link Network#self} must be assigned (as the coordinator already does) before
  * {@link #initSelf(Node)}, otherwise the projection cannot tell this node from its peers.
  */
 @Service
 public class MembershipTable {
 
+    private static final org.slf4j.Logger log = org.slf4j.LoggerFactory.getLogger(MembershipTable.class);
+
     private final Object lock = new Object();
     private final LongSupplier clock;
+
+    /** Told after every change to the live set; see {@link #addChangeListener}. */
+    private final List<Runnable> changeListeners = new CopyOnWriteArrayList<>();
+
+    /** Set, under {@link #lock}, when the live set was projected onto {@link Network}; taken by {@link #notifyChangeListeners()}. */
+    private boolean liveSetChanged;
 
     /** Every member ever heard of, keyed by node name. DEAD and LEFT records stay, as tombstones. */
     private final Map<String, Member> members = new LinkedHashMap<>();
@@ -79,6 +94,7 @@ public class MembershipTable {
             members.put(selfName, new Member(self, MemberState.ALIVE, selfIncarnation, clock.getAsLong()));
             projectIfLiveSetChanged(liveBefore);
         }
+        notifyChangeListeners();
     }
 
     /**
@@ -103,14 +119,22 @@ public class MembershipTable {
      * means the queue can never disagree with the table about which claim is the latest.
      */
     public boolean merge(Member update) {
+        boolean changed;
         synchronized (lock) {
-            Set<String> liveBefore = liveKeys();
-            boolean changed = mergeLocked(update, clock.getAsLong());
-            if (changed) {
-                projectIfLiveSetChanged(liveBefore);
-            }
-            return changed;
+            changed = mergeAndProjectLocked(update);
         }
+        notifyChangeListeners();
+        return changed;
+    }
+
+    /** {@link #merge(Member)} for a caller that already holds {@link #lock}; it leaves the listeners to that caller. */
+    private boolean mergeAndProjectLocked(Member update) {
+        Set<String> liveBefore = liveKeys();
+        boolean changed = mergeLocked(update, clock.getAsLong());
+        if (changed) {
+            projectIfLiveSetChanged(liveBefore);
+        }
+        return changed;
     }
 
     /** Every member in the table, whatever its state, in the order first heard of. */
@@ -246,10 +270,11 @@ public class MembershipTable {
         synchronized (lock) {
             for (MemberUpdate update : gossip) {
                 if (update != null && update.wellFormed()) {
-                    merge(update.toMember());
+                    mergeAndProjectLocked(update.toMember());
                 }
             }
         }
+        notifyChangeListeners(); // once for the whole message, after the lock is released
     }
 
     /** Suspects {@code name} as of now; see {@link #markSuspect(String, long)}. */
@@ -279,6 +304,7 @@ public class MembershipTable {
                 projectIfLiveSetChanged(liveBefore);
             }
         }
+        notifyChangeListeners();
     }
 
     /**
@@ -302,6 +328,7 @@ public class MembershipTable {
                 projectIfLiveSetChanged(liveBefore);
             }
         }
+        notifyChangeListeners();
     }
 
     /**
@@ -410,6 +437,46 @@ public class MembershipTable {
     private void projectIfLiveSetChanged(Set<String> liveBefore) {
         if (!liveBefore.equals(liveKeys())) {
             Network.setLiveMembers(liveNodesLocked());
+            liveSetChanged = true;
+        }
+    }
+
+    /**
+     * Registers {@code listener} to be run after every change to the live set (a member joining it or leaving
+     * it; a member merely turning suspect does not change it). The new ring is already published to
+     * {@link Network} when it runs, and the table's lock is not held, so it may call back into the table.
+     * Changes that land together (several updates of one gossip message, or a second change before the
+     * listener has returned) may be announced once: a listener should read the current state, not count calls.
+     * It runs on the thread that made the change and must not block; an exception it throws is logged and
+     * does not reach the caller or the other listeners.
+     */
+    public void addChangeListener(Runnable listener) {
+        changeListeners.add(listener);
+    }
+
+    /** Stops announcing live-set changes to {@code listener}. */
+    public void removeChangeListener(Runnable listener) {
+        changeListeners.remove(listener);
+    }
+
+    /**
+     * Announces a live-set change to the listeners, if one was projected since the last announcement. Called
+     * by the public operations only after they have left the critical section, so that no listener ever runs
+     * with the lock held.
+     */
+    private void notifyChangeListeners() {
+        synchronized (lock) {
+            if (!liveSetChanged) {
+                return;
+            }
+            liveSetChanged = false;
+        }
+        for (Runnable listener : changeListeners) {
+            try {
+                listener.run();
+            } catch (RuntimeException e) {
+                log.warn("membership change listener failed: {}", e.toString());
+            }
         }
     }
 

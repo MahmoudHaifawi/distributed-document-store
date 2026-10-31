@@ -3,6 +3,7 @@ package com.database.atypon.Node.utils.swim;
 import com.database.atypon.Node.model.Network;
 import com.database.atypon.Node.model.Node;
 import com.database.atypon.Node.utils.ring.HashRing;
+import com.database.atypon.Node.utils.swim.dto.MemberUpdate;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -13,6 +14,7 @@ import java.util.List;
 import java.util.Random;
 import java.util.TreeMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
@@ -446,6 +448,118 @@ class MembershipTableTest {
 
         assertThat(table.get(SELF).getState()).isEqualTo(MemberState.ALIVE);
         assertThat(Network.ring.physicalNodeCount()).isEqualTo(1);
+    }
+
+    // ---- change listeners ---------------------------------------------------------------------
+
+    @Test
+    void aLiveSetChangeNotifiesTheListenerOnce() {
+        AtomicInteger notified = new AtomicInteger();
+        table.addChangeListener(notified::incrementAndGet);
+
+        table.merge(m("Node1", MemberState.ALIVE, 0));
+        assertThat(notified.get()).as("a member joined the live set").isEqualTo(1);
+
+        table.merge(m("Node1", MemberState.DEAD, 0));
+        assertThat(notified.get()).as("a member left the live set").isEqualTo(2);
+    }
+
+    @Test
+    void nothingIsNotifiedWhenTheLiveSetStaysTheSame() {
+        table.merge(m("Node1", MemberState.ALIVE, 0));
+        AtomicInteger notified = new AtomicInteger();
+        table.addChangeListener(notified::incrementAndGet);
+
+        table.merge(m("Node1", MemberState.ALIVE, 0));        // nothing new
+        table.merge(m("Node1", MemberState.SUSPECT, 0));      // changes the table, but a suspect is still on the ring
+        table.merge(m("Ghost", MemberState.DEAD, 3));         // a tombstone for a node that was never live
+        table.markSuspect("Node0");                           // this node never suspects itself
+
+        assertThat(notified.get()).isZero();
+    }
+
+    @Test
+    void aSuspectDeclaredDeadNotifiesTheListener() {
+        table.merge(m("Node1", MemberState.ALIVE, 0));
+        table.markSuspect("Node1", clock.get());
+        AtomicInteger notified = new AtomicInteger();
+        table.addChangeListener(notified::incrementAndGet);
+
+        table.promoteExpiredSuspectsToDead(clock.get() + SwimConfig.suspectTimeoutMs());
+
+        assertThat(notified.get()).isEqualTo(1);
+    }
+
+    @Test
+    void aBatchOfGossipNotifiesOncePerBatch() {
+        AtomicInteger notified = new AtomicInteger();
+        table.addChangeListener(notified::incrementAndGet);
+
+        table.mergeGossip(List.of(
+                new MemberUpdate("Node1", "8080", MemberState.ALIVE, 0),
+                new MemberUpdate("Node2", "8080", MemberState.ALIVE, 0)));
+
+        assertThat(table.liveNodes()).hasSize(3);
+        assertThat(notified.get()).as("the listener sees the whole batch, once").isEqualTo(1);
+    }
+
+    @Test
+    void listenersRunAfterTheTableLockIsReleased() throws Exception {
+        AtomicBoolean tableReadableMeanwhile = new AtomicBoolean();
+        table.addChangeListener(() -> {
+            // A pull started from here must be free to use the table (and whoever else wants it must not queue
+            // behind this thread): reading it from another thread proves the lock is not held.
+            Thread reader = new Thread(() -> {
+                table.snapshot();
+                tableReadableMeanwhile.set(true);
+            });
+            reader.start();
+            try {
+                reader.join(2_000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+
+        table.merge(m("Node1", MemberState.ALIVE, 0));
+
+        assertThat(tableReadableMeanwhile.get()).isTrue();
+    }
+
+    @Test
+    void theRingIsAlreadyProjectedWhenTheListenerRuns() {
+        AtomicInteger ringSize = new AtomicInteger();
+        table.addChangeListener(() -> ringSize.set(Network.ring.physicalNodeCount()));
+
+        table.merge(m("Node1", MemberState.ALIVE, 0));
+
+        assertThat(ringSize.get()).isEqualTo(2);
+    }
+
+    @Test
+    void aFailingListenerDoesNotBreakTheTableOrTheOtherListeners() {
+        AtomicInteger notified = new AtomicInteger();
+        table.addChangeListener(() -> {
+            throw new IllegalStateException("boom");
+        });
+        table.addChangeListener(notified::incrementAndGet);
+
+        assertThat(table.merge(m("Node1", MemberState.ALIVE, 0))).isTrue();
+
+        assertThat(notified.get()).isEqualTo(1);
+        assertThat(table.get("Node1").getState()).isEqualTo(MemberState.ALIVE);
+    }
+
+    @Test
+    void aRemovedListenerIsNotNotified() {
+        AtomicInteger notified = new AtomicInteger();
+        Runnable listener = notified::incrementAndGet;
+        table.addChangeListener(listener);
+        table.removeChangeListener(listener);
+
+        table.merge(m("Node1", MemberState.ALIVE, 0));
+
+        assertThat(notified.get()).isZero();
     }
 
     // ---- helpers ------------------------------------------------------------------------------

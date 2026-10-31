@@ -164,6 +164,71 @@ public class WriteOperation {
     }
 
     /**
+     * What a node needs before documents of a schema can be handed to it by a state handoff: the schema's
+     * data directory (which {@link #applyReplicated} cannot create documents without), its definition, and
+     * an id counter that is past every id the schema already uses, so that a create made here later cannot
+     * overwrite a document that was handed over.
+     *
+     * <p>{@code offered} is the definition (the schema file) the source holds, or {@code null}. A definition
+     * already held here is never replaced (a schema cannot change once created); the counter only ever moves
+     * forward, to the larger of what is held, what {@code offered} says and {@code nextIdFloor}. Done under
+     * the same lock as every write, so it cannot interleave with a create's read-modify-write of that counter.
+     * The database directory is created if this node has never held the database; it is not registered in
+     * the user-facing database list.
+     *
+     * @return SUCCESS with {@code true} as content if the schema file was created or its counter raised,
+     *         {@code false} if nothing needed changing; ERROR if a directory or the file cannot be written
+     */
+    public Response adoptSchema(String database, String schema, JSONObject offered, int nextIdFloor) {
+        synchronized (this) {
+            try {
+                File schemaFile = new File(PathBuilder.getPathToSchema(database, schema));
+                File schemasDirectory = schemaFile.getParentFile();
+                File dataDirectory = new File(PathBuilder.getPathToAllDocuments(database, schema));
+                if (!schemasDirectory.isDirectory() && !schemasDirectory.mkdirs())
+                    return new Response(ResponseType.ERROR, "Cannot create the schemas directory");
+                if (!dataDirectory.isDirectory() && !dataDirectory.mkdirs())
+                    return new Response(ResponseType.ERROR, "Cannot create the schema data directory");
+
+                boolean held = schemaFile.exists();
+                JSONObject definition;
+                if (held) {
+                    FileReader fileReader = new FileReader(schemaFile);
+                    fileReader.read();
+                    definition = new JSONObject(fileReader.getContent());
+                } else if (offered != null) {
+                    definition = new JSONObject(offered.toString());
+                } else {
+                    return new Response(ResponseType.SUCCESS, "No schema definition to adopt", false);
+                }
+
+                JSONObject info = definition.optJSONObject(JsonKeys.INFO);
+                if (info == null) {
+                    info = new JSONObject().put(JsonKeys.SCHEMA_NAME, schema);
+                    definition.put(JsonKeys.INFO, info);
+                }
+                int offeredNextId = 0;
+                if (offered != null && offered.optJSONObject(JsonKeys.INFO) != null)
+                    offeredNextId = offered.getJSONObject(JsonKeys.INFO).optInt(JsonKeys.NEXT_ID, 0);
+                int current = info.optInt(JsonKeys.NEXT_ID, 0);
+                int target = Math.max(current, Math.max(offeredNextId, nextIdFloor));
+                if (held && target == current)
+                    return new Response(ResponseType.SUCCESS, "Schema already held", false);
+
+                info.put(JsonKeys.NEXT_ID, target);
+                if (!held)
+                    schemaFile.createNewFile();
+                Response written = new FileWriter(schemaFile, definition.toString()).write();
+                if (written.getResponseType() == ResponseType.ERROR)
+                    return written;
+                return new Response(ResponseType.SUCCESS, "Schema adopted", true);
+            } catch (Exception e) {
+                return new Response(ResponseType.ERROR, e.getMessage());
+            }
+        }
+    }
+
+    /**
      * Replica side of an update: stores the copy the origin stamped, reconciled against the local one. See
      * {@link #applyReplicated}.
      */
