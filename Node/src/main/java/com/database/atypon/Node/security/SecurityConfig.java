@@ -10,7 +10,8 @@ import org.springframework.security.web.authentication.UsernamePasswordAuthentic
 
 /**
  * Stateless JWT resource-server security for the data node. The {@link JwtAuthFilter} authenticates
- * from the Bearer token; these URL rules enforce the role hierarchy (INTERNAL ⊇ ADMIN ⊇ USER).
+ * from the Bearer token; these URL rules enforce the role hierarchy (INTERNAL ⊇ ADMIN ⊇ USER). The Actuator
+ * {@code /actuator/health} and {@code /actuator/prometheus} endpoints are public so Prometheus can scrape without a token.
  */
 @Configuration
 @EnableWebSecurity
@@ -24,6 +25,8 @@ public class SecurityConfig {
                 .and()
                 .authorizeRequests()
                 .antMatchers("/login", "/health").permitAll()
+                // Prometheus scrape + liveness probe: no token (the only Actuator endpoints exposed, see the app module)
+                .antMatchers("/actuator/health", "/actuator/prometheus").permitAll()
                 .antMatchers("/network/**").hasRole("INTERNAL")
                 // SWIM failure-detector probes are node-to-node traffic, never a client's
                 .antMatchers("/swim/**").hasRole("INTERNAL")

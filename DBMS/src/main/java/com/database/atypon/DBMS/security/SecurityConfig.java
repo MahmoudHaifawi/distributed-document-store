@@ -10,7 +10,8 @@ import org.springframework.security.web.SecurityFilterChain;
  * Form-login security for the Thymeleaf gateway. Authentication is delegated to the cluster via
  * {@link NodeAuthenticationProvider}; on success the node-issued JWT and node URL are stashed in the
  * HTTP session so the existing controllers keep reading {@code session["token"]} / {@code ["nodeURL"]}
- * and forward the JWT as a Bearer token. Replaces the former custom AuthInterceptor.
+ * and forward the JWT as a Bearer token. Replaces the former custom AuthInterceptor. The Actuator
+ * {@code /actuator/health} and {@code /actuator/prometheus} endpoints are public so Prometheus can scrape without a login.
  */
 @Configuration
 @EnableWebSecurity
@@ -28,6 +29,8 @@ public class SecurityConfig {
                 .authenticationProvider(provider)
                 .authorizeRequests()
                 .antMatchers("/login", "/css/**", "/js/**", "/webjars/**").permitAll()
+                // Prometheus scrape + liveness probe: no login (the only Actuator endpoints exposed, see the app module)
+                .antMatchers("/actuator/health", "/actuator/prometheus").permitAll()
                 .anyRequest().authenticated()
                 .and()
                 .formLogin()

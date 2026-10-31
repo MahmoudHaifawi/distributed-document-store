@@ -36,6 +36,11 @@
 				</exclusion>
 			</exclusions>
 		</dependency>
+		<!-- M12 observability: lets the node register custom meters; the registry itself is wired in the app module -->
+		<dependency>
+			<groupId>io.micrometer</groupId>
+			<artifactId>micrometer-core</artifactId>
+		</dependency>
 		<dependency>
 			<groupId>org.json</groupId>
 			<artifactId>json</artifactId>

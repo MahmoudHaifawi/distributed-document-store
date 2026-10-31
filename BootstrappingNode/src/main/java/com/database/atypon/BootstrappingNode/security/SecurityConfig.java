@@ -12,7 +12,8 @@ import org.springframework.security.web.authentication.UsernamePasswordAuthentic
  * Stateless JWT security for the bootstrapping node. {@code /getUserNode} and {@code /test} are
  * public ({@code getUserNode} runs during the login handshake, before the user holds a token);
  * creating users requires ADMIN, and mesh wiring ({@code /network/**}) and the SWIM seed
- * ({@code /swim/**}, where data nodes join the cluster) require INTERNAL.
+ * ({@code /swim/**}, where data nodes join the cluster) require INTERNAL. The Actuator {@code /actuator/health} and
+ * {@code /actuator/prometheus} endpoints are public so Prometheus can scrape without a token.
  */
 @Configuration
 @EnableWebSecurity
@@ -26,6 +27,8 @@ public class SecurityConfig {
                 .and()
                 .authorizeRequests()
                 .antMatchers("/test", "/getUserNode").permitAll()
+                // Prometheus scrape + liveness probe: no token (the only Actuator endpoints exposed, see the app module)
+                .antMatchers("/actuator/health", "/actuator/prometheus").permitAll()
                 .antMatchers("/createNewUser").hasRole("ADMIN")
                 .antMatchers("/network/**").hasRole("INTERNAL")
                 .antMatchers("/swim/**").hasRole("INTERNAL")
