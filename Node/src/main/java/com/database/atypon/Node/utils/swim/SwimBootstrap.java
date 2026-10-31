@@ -16,6 +16,7 @@ import java.net.UnknownHostException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -94,9 +95,16 @@ public class SwimBootstrap {
             return false;
         }
         self = me;
-        // The table tells this node from its peers by Network.self, so that is assigned first (and a name the
-        // coordinator already assigned is not replaced).
-        if (Network.self == null) {
+        // The table tells this node from its peers by Network.self, so that is assigned first. A node has exactly
+        // one identity: the ring is keyed by the name it announces, so if an identity was assigned under another
+        // name it is replaced, not kept beside this one (that would put one machine on the ring twice, and make it
+        // route to itself over HTTP).
+        Node assigned = Network.self;
+        if (assigned != null && !sameAddress(assigned, me)) {
+            log.warn("SWIM: this node is configured as {}:{} but was already assigned the identity {}:{}; it uses {} only",
+                    me.getName(), me.getPort(), assigned.getName(), assigned.getPort(), me.getName());
+        }
+        if (assigned == null || !sameAddress(assigned, me)) {
             Network.self = me;
         }
         membership.initSelf(me);
@@ -172,9 +180,20 @@ public class SwimBootstrap {
         return peers;
     }
 
+    private static boolean sameAddress(Node a, Node b) {
+        return Objects.equals(a.getName(), b.getName()) && Objects.equals(a.getPort(), b.getPort());
+    }
+
     /**
-     * Who this node is: the configured {@code NODE_NAME}, else the identity it was already assigned, else its
-     * host name, on the port the server listens on. Null only if all of that fails.
+     * Who this node is: the configured {@code NODE_NAME} (which wins, and replaces any identity assigned under
+     * another name), else the identity it was already assigned, else its host name, on the port the server
+     * listens on. Null only if all of that fails.
+     *
+     * <p>The name is what the ring is keyed by, so it has to be the same every time this node starts: a
+     * different name moves every one of its virtual nodes, and data already on its disk is then looked for on
+     * other nodes. {@code NODE_NAME} (or an assigned identity) is stable; the host name is not (under
+     * docker-compose it is the container id, new for every recreated container), so falling back to it is
+     * allowed, to let a bare node start, but is logged as a warning.
      */
     private Node identity() {
         String name = SwimConfig.nodeName();
@@ -184,6 +203,12 @@ public class SwimBootstrap {
                 return assigned;
             }
             name = hostName();
+            if (name != null) {
+                log.warn("SWIM: NODE_NAME is not set and no identity was assigned, so this node announces itself by its host "
+                        + "name '{}'. That name is not stable (under docker-compose it is the container id, which changes when "
+                        + "the container is recreated): the ring places data by node name, so after a restart under another "
+                        + "name the data already on this node's disk may not be found. Set NODE_NAME.", name);
+            }
         }
         return name == null ? null : new Node(name, serverPort);
     }

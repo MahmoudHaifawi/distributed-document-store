@@ -8,6 +8,9 @@ import com.database.atypon.Node.utils.swim.dto.AckMessage;
 import com.database.atypon.Node.utils.swim.dto.MemberUpdate;
 import com.database.atypon.Node.utils.swim.dto.PingMessage;
 import com.database.atypon.Node.utils.swim.dto.PingReqMessage;
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sun.net.httpserver.HttpExchange;
@@ -364,7 +367,6 @@ class JoinLeaveTest {
     @Test
     void aNodeThatLeftCanComeBackUnderTheSameName() throws Exception {
         RealNode b = realNode();
-        Network.self = b.node();
         b.table().merge(m("NodeA", MemberState.LEFT, 0));
         env("SEED_NODES", b.stub().address(), "NODE_NAME", "NodeA");
         MembershipTable tableA = newTable();
@@ -438,20 +440,87 @@ class JoinLeaveTest {
     }
 
     @Test
+    void nodeNameReplacesAConflictingAssignedIdentityLeavingOneRingEntry() throws Exception {
+        // The legacy wiring assigned this node the identity "Assigned" and built a ring around it and a peer.
+        Network.nodes = Collections.synchronizedList(new ArrayList<>(List.of(n("Node1"))));
+        Network.self = n("Assigned");
+        Network.rebuildRing();
+        assertThat(Network.ring.preferenceList("some-schema", 5)).extracting(Node::getName)
+                .containsExactlyInAnyOrder("Assigned", "Node1");
+        Stub seed = stub();
+        seed.responder = (path, body) -> snapshotJson(new MemberUpdate("127.0.0.1", seed.node.getPort(), MemberState.ALIVE, 0));
+        seed.server.start();
+        env("SEED_NODES", seed.address(), "NODE_NAME", "NodeX");
+        MembershipTable table = newTable();
+        SwimBootstrap bootstrap = bootstrapFor(table);
+
+        List<String> warnings = warningsDuring(() -> assertThat(bootstrap.join()).isTrue());
+
+        // One identity, the configured one, in the node, in the table, on the wire and on the ring: this machine
+        // is not on the ring twice (which would also make it route to itself over HTTP), and the stale
+        // assignment and the stale wiring are gone.
+        assertThat(Network.self.getName()).isEqualTo("NodeX");
+        assertThat(table.get("NodeX").getState()).isEqualTo(MemberState.ALIVE);
+        assertThat(table.get("Assigned")).isNull();
+        assertThat(JSON.readTree(seed.only("/swim/join").body()).get("name").asText()).isEqualTo("NodeX");
+        assertThat(Network.ring.physicalNodeCount()).isEqualTo(2);
+        assertThat(Network.ring.preferenceList("some-schema", 5)).extracting(Node::getName)
+                .containsExactlyInAnyOrder("NodeX", "127.0.0.1");
+        assertThat(Network.nodes).extracting(Node::getName).containsExactly("127.0.0.1");
+        assertThat(warnings).anySatisfy(w -> assertThat(w).contains("NodeX").contains("Assigned"));
+    }
+
+    @Test
+    void nodeNameMatchingTheAssignedIdentityChangesNothing() {
+        Node assigned = new Node("NodeX", "8080");
+        Network.self = assigned;
+        env("NODE_NAME", "NodeX");
+        MembershipTable table = newTable();
+
+        List<String> warnings = warningsDuring(() -> bootstrapFor(table).join());
+
+        assertThat(Network.self).isSameAs(assigned);
+        assertThat(Network.ring.physicalNodeCount()).isEqualTo(1);
+        assertThat(warnings).as("nothing to warn about: the two agree and the name is configured").isEmpty();
+    }
+
+    @Test
     void aNodeWithoutAnyNameStillStartsInsteadOfFailing() {
         // no NODE_NAME and no assigned identity: the host name stands in, whatever it is
         MembershipTable table = newTable();
 
-        bootstrapFor(table).join();
+        List<String> warnings = warningsDuring(() -> bootstrapFor(table).join());
 
         assertThat(Network.self).isNotNull();
         assertThat(table.get(Network.self.getName()).getState()).isEqualTo(MemberState.ALIVE);
+        // ... but not quietly: the host name is not stable (a container id changes with the container), the
+        // ring places data by name, and a restart under another name strands what is on disk
+        assertThat(warnings).hasSize(1);
+        assertThat(warnings.get(0)).contains("NODE_NAME").contains("not stable").contains("data");
+        assertThat(warnings.get(0)).contains(Network.self.getName());
+    }
+
+    /** The WARN-level messages {@link SwimBootstrap} logs while {@code action} runs. */
+    private static List<String> warningsDuring(Runnable action) {
+        ch.qos.logback.classic.Logger logger =
+                (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(SwimBootstrap.class);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        logger.addAppender(appender);
+        try {
+            action.run();
+        } finally {
+            logger.detachAppender(appender);
+        }
+        return appender.list.stream()
+                .filter(event -> event.getLevel() == Level.WARN)
+                .map(ILoggingEvent::getFormattedMessage)
+                .toList();
     }
 
     @Test
     void aRestartedNodeJoinsAndRefutesItsOwnDeathCertificate() throws Exception {
         RealNode b = realNode();
-        Network.self = b.node();
         // while this node was down B declared it dead at incarnation 2; the new process starts at 0
         b.table().merge(m("NodeA", MemberState.DEAD, 2));
         env("SEED_NODES", b.stub().address(), "NODE_NAME", "NodeA");
@@ -469,14 +538,16 @@ class JoinLeaveTest {
     @Test
     void leaveMarksLeftAndDropsFromRing() throws Exception {
         RealNode b = realNode();
-        Network.self = b.node(); // the statics are B's: this is the ring B routes by
         env("SEED_NODES", b.stub().address(), "NODE_NAME", "NodeA");
         MembershipTable tableA = newTable();
         SwimBootstrap a = bootstrapFor(tableA);
         assertThat(a.join()).isTrue();
         assertThat(b.table().liveNodes()).extracting(Node::getName).contains("NodeA");
-        assertThat(Network.ring.physicalNodeCount()).as("A is on B's ring once it has joined").isEqualTo(2);
+        assertThat(Network.ring.physicalNodeCount()).as("A is on the ring once it has joined").isEqualTo(2);
 
+        // Both nodes live in this JVM and share the one set of statics; from here on they are B's, so
+        // the ring they hold is the ring B routes by, and B's projections are what the assertions below read.
+        Network.self = b.node();
         a.leave();
 
         assertThat(described(List.of(b.table().get("NodeA")))).containsExactly("NodeA:LEFT@0");
