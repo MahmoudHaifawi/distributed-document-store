@@ -11,7 +11,8 @@ import org.springframework.security.web.authentication.UsernamePasswordAuthentic
 /**
  * Stateless JWT security for the bootstrapping node. {@code /getUserNode} and {@code /test} are
  * public ({@code getUserNode} runs during the login handshake, before the user holds a token);
- * creating users requires ADMIN and mesh wiring requires INTERNAL.
+ * creating users requires ADMIN, and mesh wiring ({@code /network/**}) and the SWIM seed
+ * ({@code /swim/**}, where data nodes join the cluster) require INTERNAL.
  */
 @Configuration
 @EnableWebSecurity
@@ -27,6 +28,7 @@ public class SecurityConfig {
                 .antMatchers("/test", "/getUserNode").permitAll()
                 .antMatchers("/createNewUser").hasRole("ADMIN")
                 .antMatchers("/network/**").hasRole("INTERNAL")
+                .antMatchers("/swim/**").hasRole("INTERNAL")
                 .anyRequest().authenticated()
                 .and()
                 .addFilterBefore(jwtAuthFilter, UsernamePasswordAuthenticationFilter.class);
