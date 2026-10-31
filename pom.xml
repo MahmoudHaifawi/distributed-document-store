@@ -26,5 +26,6 @@
         <module>BootstrappingNode</module>
         <module>DBMS</module>
         <module>app</module>
+        <module>ycsb-binding</module>
     </modules>
 </project>
