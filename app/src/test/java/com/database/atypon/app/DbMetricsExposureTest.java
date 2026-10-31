@@ -92,6 +92,24 @@ class DbMetricsExposureTest {
         }
     }
 
+    /**
+     * The dashboard's p50/p95/p99 panels run {@code histogram_quantile} over {@code http_server_requests_seconds_bucket}.
+     * Micrometer publishes that series only when the percentiles histogram is switched on for {@code http.server.requests};
+     * without it the scrape carries just {@code _count}/{@code _sum}/{@code _max} and those panels read "No data".
+     */
+    @Test
+    void theHttpLatencyHistogramBucketsAreScrapedForTheDashboardPercentiles() throws Exception {
+        mvc.perform(get("/actuator/health")).andExpect(status().isOk()); // a handled request, so the timer has recorded
+
+        List<String> buckets = scrapedLines().stream()
+                .filter(l -> l.startsWith("http_server_requests_seconds_bucket{"))
+                .collect(Collectors.toList());
+        assertFalse(buckets.isEmpty(), "no http_server_requests_seconds_bucket series: histogram_quantile has nothing to read");
+        assertTrue(buckets.stream().anyMatch(l -> l.contains("le=\"+Inf\"")), "the +Inf bucket is missing");
+        assertTrue(buckets.stream().anyMatch(l -> l.matches(".*le=\"0\\.\\d+\".*")),
+                "no finite sub-second latency buckets to interpolate p50/p95/p99 from");
+    }
+
     @Test
     void aRecordedEventShowsUpInTheScrape() throws Exception {
         dbMetrics.recordWrite(DbMetrics.WriteResult.QUORUM_FAILED, DbMetrics.WriteType.UPDATE,
