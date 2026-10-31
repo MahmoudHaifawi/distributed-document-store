@@ -8,6 +8,9 @@ import java.util.List;
 /** Pure quorum arithmetic shared by the write and read paths. */
 public final class Quorum {
 
+    /** The start of the message of the ERROR a write that missed its quorum is answered with. */
+    private static final String QUORUM_NOT_MET = "write quorum not met";
+
     private Quorum() {
     }
 
@@ -55,6 +58,18 @@ public final class Quorum {
         if (acks >= w) {
             return localResult;
         }
-        return new Response(ResponseType.ERROR, "write quorum not met (" + acks + "/" + w + ")");
+        return new Response(ResponseType.ERROR, QUORUM_NOT_MET + " (" + acks + "/" + w + ")");
+    }
+
+    /**
+     * Whether {@code response} is the ERROR {@link #writeClientResult} gives a write that did not reach its
+     * quorum, as opposed to any other failure. It is how a node that handed a write to the primary can tell,
+     * from the answer it got back, that the write was applied there but not acknowledged by enough replicas.
+     */
+    public static boolean isWriteQuorumFailure(Response response) {
+        return response != null
+                && response.getResponseType() == ResponseType.ERROR
+                && response.getMessage() != null
+                && response.getMessage().startsWith(QUORUM_NOT_MET);
     }
 }

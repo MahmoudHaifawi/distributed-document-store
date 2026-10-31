@@ -1,5 +1,6 @@
 package com.database.atypon.Node.operations.write;
 
+import com.database.atypon.Node.metrics.DbMetrics;
 import com.database.atypon.Node.model.Network;
 import com.database.atypon.Node.services.index.IndexManager;
 import com.database.atypon.Node.utils.JsonKeys;
@@ -12,6 +13,7 @@ import com.database.atypon.Node.utils.response.ResponseType;
 import com.database.atypon.Node.utils.vclock.Reconcile;
 import com.database.atypon.Node.utils.vclock.VectorClock;
 import org.json.JSONObject;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.io.File;
@@ -22,9 +24,17 @@ public class WriteOperation {
     private static final org.slf4j.Logger log = org.slf4j.LoggerFactory.getLogger(WriteOperation.class);
 
     private final IndexManager indexManager;
+    private final DbMetrics metrics;
 
-    public WriteOperation(IndexManager indexManager) {
+    @Autowired
+    public WriteOperation(IndexManager indexManager, DbMetrics metrics) {
         this.indexManager = indexManager;
+        this.metrics = metrics;
+    }
+
+    /** A write operation whose consistency metrics go to a private registry nobody scrapes. */
+    public WriteOperation(IndexManager indexManager) {
+        this(indexManager, DbMetrics.detached());
     }
 
     public Response createSchema(String database, String schemaName, JSONObject schemaDetails) {
@@ -245,6 +255,8 @@ public class WriteOperation {
      * never written and applying the same copy twice changes nothing. A tombstone winner fires the delete hook
      * (handing it the live copy it replaced, so the index drops that document's keys), any other winner the
      * update hook. The response is SUCCESS either way; its content says whether the winner was applied.
+     * Once the copies are settled it counts how they related ({@code db_reconcile_conflicts_total}) and, when a
+     * tombstone was stored, {@code db_tombstone_written_total}; an identical or absent local copy is no conflict.
      *
      * <p>This is the internal replication path for data the origin already validated, so it does not
      * schema-validate: a tombstone carries no schema fields, and the numeric round-trip inside
@@ -263,18 +275,23 @@ public class WriteOperation {
                 }
 
                 JSONObject winner = Reconcile.winner(local, incoming);
-                if (local != null && local.similar(winner))
+                VectorClock.Ordering relation = Reconcile.relation(local, incoming); // null when nothing is stored
+                if (local != null && local.similar(winner)) {
+                    metrics.recordReconcile(relation);
                     return new Response(ResponseType.SUCCESS, "Replication skipped: local copy is current", false);
+                }
 
                 if (local == null)
                     documentFile.createNewFile();
                 Response written = new FileWriter(documentFile, winner.toString()).write();
                 if (written.getResponseType() == ResponseType.ERROR)
                     return written;
+                metrics.recordReconcile(relation); // settled and stored: the outcome is final
 
                 int docId = Integer.parseInt(id);
                 JSONObject replaced = local != null ? local : new JSONObject();
                 if (Reconcile.isTombstone(winner)) {
+                    metrics.recordTombstoneWritten();
                     fireOnDelete(database, schema, docId, replaced);
                     return new Response(ResponseType.SUCCESS, "Document deleted successfully", true);
                 }
@@ -336,6 +353,7 @@ public class WriteOperation {
                 Response written = new FileWriter(documentFile, tombstone.toString()).write();
                 if (written.getResponseType() == ResponseType.ERROR)
                     return new Response(ResponseType.ERROR, "Failed to delete document");
+                metrics.recordTombstoneWritten();
                 fireOnDelete(database, schema, Integer.parseInt(id), doc);
                 return new Response(ResponseType.SUCCESS, "Document deleted successfully", tombstone.toString());
             } catch (Exception e) {

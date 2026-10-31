@@ -1,5 +1,9 @@
 package com.database.atypon.Node.controllers.write;
 
+import com.database.atypon.Node.metrics.DbMetrics;
+import com.database.atypon.Node.metrics.DbMetrics.WriteOrigin;
+import com.database.atypon.Node.metrics.DbMetrics.WriteResult;
+import com.database.atypon.Node.metrics.DbMetrics.WriteType;
 import com.database.atypon.Node.model.Node;
 import com.database.atypon.Node.security.SecurityUtils;
 import com.database.atypon.Node.services.write.WriteService;
@@ -12,6 +16,7 @@ import com.database.atypon.Node.utils.response.Response;
 import com.database.atypon.Node.utils.response.ResponseType;
 import com.database.atypon.Node.utils.ring.RingRouter;
 import org.json.JSONObject;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.HashMap;
@@ -23,9 +28,17 @@ import java.util.Vector;
 public class WriteController {
 
     private final WriteService writeService;
+    private final DbMetrics metrics;
 
-    public WriteController(WriteService writeService) {
+    @Autowired
+    public WriteController(WriteService writeService, DbMetrics metrics) {
         this.writeService = writeService;
+        this.metrics = metrics;
+    }
+
+    /** A controller whose write metrics go to a private registry nobody scrapes. */
+    public WriteController(WriteService writeService) {
+        this(writeService, DbMetrics.detached());
     }
 
     private static boolean isInternal() {
@@ -78,15 +91,15 @@ public class WriteController {
         Response affinityResponse = AffinityLoadBalancer.checkAffinity(database, schema);
         if(affinityResponse.getResponseType() == ResponseType.ERROR){
             Node node = (Node) affinityResponse.getContent();
-            return Forwarder.forwardForResponses(node,
-                    "/write/document/new?database=" + database + "&schema=" + schema, document);
+            return forwarded(WriteType.CREATE, Forwarder.forwardForResponses(node,
+                    "/write/document/new?database=" + database + "&schema=" + schema, document));
         }
         Response localResult = writeService.createDocument(database, schema, document);
 
         List<Response> replicaResponses = localResult.getResponseType() == ResponseType.SUCCESS
                 ? writeService.broadcastDocument(database, schema, document)
                 : List.of();
-        return withWriteQuorum(database, schema, localResult, replicaResponses);
+        return withWriteQuorum(WriteType.CREATE, database, schema, localResult, replicaResponses);
     }
 
     @PostMapping(value = "/document/update", produces = "application/json")
@@ -98,8 +111,8 @@ public class WriteController {
             return new Vector<>(List.of(writeService.applyUpdate(database, schema, id, document)));
 
         if (!RingRouter.isPrimary(database, schema))
-            return Forwarder.forwardForResponses(RingRouter.primaryFor(database, schema),
-                    "/write/document/update?database=" + database + "&schema=" + schema + "&id=" + id, document);
+            return forwarded(WriteType.UPDATE, Forwarder.forwardForResponses(RingRouter.primaryFor(database, schema),
+                    "/write/document/update?database=" + database + "&schema=" + schema + "&id=" + id, document));
 
         int expectedVersion = 1;
         Object v = document.get("_version");
@@ -114,7 +127,7 @@ public class WriteController {
             document.put("_version", ((Number) result.getContent()).intValue());
             replicaResponses = writeService.broadcastUpdate(database, schema, id, document);
         }
-        return withWriteQuorum(database, schema, result, replicaResponses);
+        return withWriteQuorum(WriteType.UPDATE, database, schema, result, replicaResponses);
     }
 
     /**
@@ -145,9 +158,9 @@ public class WriteController {
             return new Vector<>(List.of(writeService.applyDelete(database, schema, id)));
 
         if (!RingRouter.isPrimary(database, schema))
-            return Forwarder.forwardForResponses(RingRouter.primaryFor(database, schema),
+            return forwarded(WriteType.DELETE, Forwarder.forwardForResponses(RingRouter.primaryFor(database, schema),
                     "/write/document/delete?database=" + database + "&schema=" + schema + "&id=" + id
-                            + "&version=" + version, null);
+                            + "&version=" + version, null));
 
         Response result = writeService.deleteDocument(database, schema, id, version);
 
@@ -156,7 +169,7 @@ public class WriteController {
         List<Response> replicaResponses = result.getResponseType() == ResponseType.SUCCESS
                 ? writeService.broadcastUpdate(database, schema, id, tombstoneOf(result))
                 : List.of();
-        return withWriteQuorum(database, schema, result, replicaResponses);
+        return withWriteQuorum(WriteType.DELETE, database, schema, result, replicaResponses);
     }
 
     /** The tombstone a successful origin delete returned (as a JSON string in its content), as a replicable map. */
@@ -183,5 +196,41 @@ public class WriteController {
             responses.set(0, Quorum.writeClientResult(true, localResult, replicaResponses, w));
         }
         return responses;
+    }
+
+    /**
+     * {@link #withWriteQuorum(String, String, Response, List)} for a document write, then counts the write
+     * this node originated, now that its quorum verdict is known: a write that was applied here and
+     * acknowledged by W replicas is a success, one that was applied here but not acknowledged by enough
+     * replicas is {@code quorum_failed}. A write the local apply rejected (a validation error, a version
+     * conflict) reached no quorum either way and is not counted, nor is the fan-out of one that never
+     * fanned out. The fan-out recorded is how many replicas the write was copied to.
+     */
+    private Vector<Response> withWriteQuorum(WriteType type, String database, String schema, Response localResult,
+                                             List<Response> replicaResponses) {
+        Vector<Response> responses = withWriteQuorum(database, schema, localResult, replicaResponses);
+        if (localResult.getResponseType() == ResponseType.SUCCESS) {
+            WriteResult result = responses.get(0).getResponseType() == ResponseType.SUCCESS
+                    ? WriteResult.SUCCESS : WriteResult.QUORUM_FAILED;
+            metrics.recordWrite(result, type, WriteOrigin.LOCAL);
+            metrics.recordWriteFanout(replicaResponses.size());
+        }
+        return responses;
+    }
+
+    /**
+     * Counts a write this node handed to its primary, by what the primary answered: applied and acknowledged
+     * is a success, applied but short of its quorum is {@code quorum_failed}, and any other answer (the
+     * primary rejected it, or could not be reached) is not counted. The primary counts the write as its own
+     * and records the fan-out, so a cluster-wide total of successes should use {@code origin="local"}.
+     */
+    private Vector<Response> forwarded(WriteType type, Vector<Response> primaryAnswer) {
+        Response first = primaryAnswer.isEmpty() ? null : primaryAnswer.get(0);
+        if (first != null && first.getResponseType() == ResponseType.SUCCESS) {
+            metrics.recordWrite(WriteResult.SUCCESS, type, WriteOrigin.FORWARDED);
+        } else if (Quorum.isWriteQuorumFailure(first)) {
+            metrics.recordWrite(WriteResult.QUORUM_FAILED, type, WriteOrigin.FORWARDED);
+        }
+        return primaryAnswer;
     }
 }

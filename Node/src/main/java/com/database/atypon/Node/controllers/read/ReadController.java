@@ -1,5 +1,6 @@
 package com.database.atypon.Node.controllers.read;
 
+import com.database.atypon.Node.metrics.DbMetrics;
 import com.database.atypon.Node.security.SecurityUtils;
 import com.database.atypon.Node.services.read.QuorumReadService;
 import com.database.atypon.Node.services.read.ReadService;
@@ -15,10 +16,12 @@ public class ReadController {
 
    private final ReadService readService;
    private final QuorumReadService quorumReadService;
+   private final DbMetrics metrics;
 
-   public ReadController(ReadService readService, QuorumReadService quorumReadService) {
+   public ReadController(ReadService readService, QuorumReadService quorumReadService, DbMetrics metrics) {
        this.readService = readService;
        this.quorumReadService = quorumReadService;
+       this.metrics = metrics;
    }
 
    private static boolean isInternal() {
@@ -63,6 +66,9 @@ public class ReadController {
            return Forwarder.forwardForResponse(RingRouter.primaryFor(databaseName, schemaName),
                    "/user/read/all?databaseName=" + databaseName + "&schemaName=" + schemaName, null, false);
 
-       return readService.fetchAll(databaseName, schemaName);
+       Response all = readService.fetchAll(databaseName, schemaName);
+       if (all.getResponseType() == ResponseType.SUCCESS)
+           metrics.recordRead(DbMetrics.ReadPath.ALL);
+       return all;
     }
 }

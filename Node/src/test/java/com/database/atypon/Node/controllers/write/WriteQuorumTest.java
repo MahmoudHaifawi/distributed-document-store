@@ -58,4 +58,18 @@ class WriteQuorumTest {
         Response r = Quorum.writeClientResult(true, local, List.of(new Response(ResponseType.ERROR, "down")), 3);
         assertThat(r.getMessage()).isEqualTo("write quorum not met (1/3)");
     }
+
+    @Test
+    void onlyTheQuorumNotMetErrorIsAWriteQuorumFailure() {
+        Response local = new Response(ResponseType.SUCCESS, "ok");
+        Response missed = Quorum.writeClientResult(true, local, List.of(), 2);
+
+        assertThat(Quorum.isWriteQuorumFailure(missed)).isTrue();
+        assertThat(Quorum.isWriteQuorumFailure(local)).isFalse();
+        assertThat(Quorum.isWriteQuorumFailure(new Response(ResponseType.ERROR, "Version conflict: document is at version 4")))
+                .isFalse();
+        assertThat(Quorum.isWriteQuorumFailure(new Response(ResponseType.SUCCESS, "write quorum not met"))).isFalse();
+        assertThat(Quorum.isWriteQuorumFailure(new Response(ResponseType.ERROR, null))).isFalse();
+        assertThat(Quorum.isWriteQuorumFailure(null)).isFalse();
+    }
 }

@@ -108,4 +108,26 @@ class ReconcileTest {
         assertThat(Reconcile.isTombstone(doc("{\"_deleted\":false}"))).isFalse();
         assertThat(Reconcile.isTombstone(doc("{\"_deleted\":true}"))).isTrue();
     }
+
+    @Test
+    void relationClassifiesTwoCopiesWithoutPickingAWinner() {
+        JSONObject older = doc("{\"_vclock\":{\"A\":1},\"_ts\":10,\"n\":1}");
+        JSONObject newer = doc("{\"_vclock\":{\"A\":2},\"_ts\":5,\"n\":2}");
+        JSONObject other = doc("{\"_vclock\":{\"B\":1},\"_ts\":20,\"n\":3}");
+
+        assertThat(Reconcile.relation(newer, older)).isEqualTo(VectorClock.Ordering.DESCENDS);
+        assertThat(Reconcile.relation(older, newer)).isEqualTo(VectorClock.Ordering.DESCENDED_BY);
+        assertThat(Reconcile.relation(older, other)).isEqualTo(VectorClock.Ordering.CONCURRENT);
+        assertThat(Reconcile.relation(older, doc("{\"_vclock\":{\"A\":1},\"n\":9}")))
+                .isEqualTo(VectorClock.Ordering.EQUAL);
+    }
+
+    @Test
+    void aMissingCopyHasNoRelationAndAMissingClockIsEmpty() {
+        JSONObject stamped = doc("{\"_vclock\":{\"A\":1},\"n\":1}");
+        assertThat(Reconcile.relation(null, stamped)).isNull();
+        assertThat(Reconcile.relation(stamped, null)).isNull();
+        assertThat(Reconcile.relation(doc("{\"n\":1}"), stamped)).isEqualTo(VectorClock.Ordering.DESCENDED_BY);
+        assertThat(Reconcile.relation(doc("{\"n\":1}"), doc("{\"n\":2}"))).isEqualTo(VectorClock.Ordering.EQUAL);
+    }
 }

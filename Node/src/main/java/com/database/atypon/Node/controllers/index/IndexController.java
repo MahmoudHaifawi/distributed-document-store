@@ -1,6 +1,7 @@
 package com.database.atypon.Node.controllers.index;
 
 import com.database.atypon.Node.index.BPlusTree;
+import com.database.atypon.Node.metrics.DbMetrics;
 import com.database.atypon.Node.model.Node;
 import com.database.atypon.Node.security.SecurityUtils;
 import com.database.atypon.Node.services.index.IndexManager;
@@ -8,6 +9,7 @@ import com.database.atypon.Node.utils.Forwarder;
 import com.database.atypon.Node.utils.response.Response;
 import com.database.atypon.Node.utils.response.ResponseType;
 import com.database.atypon.Node.utils.ring.RingRouter;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.HashMap;
@@ -18,9 +20,17 @@ import java.util.Vector;
 public class IndexController {
 
     private final IndexManager indexManager;
+    private final DbMetrics metrics;
 
-    public IndexController(IndexManager indexManager) {
+    @Autowired
+    public IndexController(IndexManager indexManager, DbMetrics metrics) {
         this.indexManager = indexManager;
+        this.metrics = metrics;
+    }
+
+    /** A controller whose read metrics go to a private registry nobody scrapes. */
+    public IndexController(IndexManager indexManager) {
+        this(indexManager, DbMetrics.detached());
     }
 
     private static boolean isAdminOrigin() {
@@ -114,6 +124,7 @@ public class IndexController {
             Object rawOffset = body.get("offset");
             int offset = (rawOffset instanceof Number) ? ((Number) rawOffset).intValue() : 0;
             List<Integer> ids = indexManager.query(database, schema, field, op, value, high, ascending, offset, limit);
+            metrics.recordRead(DbMetrics.ReadPath.INDEX);
             return new Response(ResponseType.SUCCESS, "Query results", ids);
         } catch (Exception e) {
             return new Response(ResponseType.ERROR, e.getMessage());

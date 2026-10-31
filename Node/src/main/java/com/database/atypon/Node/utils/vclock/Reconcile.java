@@ -69,6 +69,22 @@ public final class Reconcile {
         return result;
     }
 
+    /**
+     * How the clock of {@code a} relates to the clock of {@code b}: {@link VectorClock.Ordering#DESCENDS} when
+     * {@code a} causally follows {@code b}, {@link VectorClock.Ordering#DESCENDED_BY} when {@code b} follows
+     * {@code a}, {@code CONCURRENT} when neither does, {@code EQUAL} when they are the same. This is the
+     * classification {@link #winner} acts on, exposed so a caller can report how a reconcile was settled
+     * without this class knowing anything about who is asking. A null operand has nothing to be related to,
+     * so the answer is null. Neither input is modified.
+     */
+    public static VectorClock.Ordering relation(JSONObject a, JSONObject b) {
+        if (a == null || b == null) {
+            return null;
+        }
+        return VectorClock.fromJson(a.optJSONObject(JsonKeys.VCLOCK))
+                .compare(VectorClock.fromJson(b.optJSONObject(JsonKeys.VCLOCK)));
+    }
+
     private static JSONObject concurrentWinner(JSONObject a, VectorClock clockA, JSONObject b, VectorClock clockB) {
         long tsA = a.optLong(JsonKeys.TS, 0);
         long tsB = b.optLong(JsonKeys.TS, 0);

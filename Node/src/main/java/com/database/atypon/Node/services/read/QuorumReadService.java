@@ -1,5 +1,6 @@
 package com.database.atypon.Node.services.read;
 
+import com.database.atypon.Node.metrics.DbMetrics;
 import com.database.atypon.Node.model.Network;
 import com.database.atypon.Node.model.Node;
 import com.database.atypon.Node.security.ServiceTokens;
@@ -63,10 +64,12 @@ public class QuorumReadService {
 
     private final ReadService readService;
     private final WriteService writeService;
+    private final DbMetrics metrics;
 
-    public QuorumReadService(ReadService readService, WriteService writeService) {
+    public QuorumReadService(ReadService readService, WriteService writeService, DbMetrics metrics) {
         this.readService = readService;
         this.writeService = writeService;
+        this.metrics = metrics;
     }
 
     /**
@@ -75,6 +78,12 @@ public class QuorumReadService {
      * Replicas whose copy differs from the winner are repaired before this returns.
      */
     public Response readById(String db, String schema, String id) {
+        Response answer = quorumRead(db, schema, id);
+        metrics.recordRead(DbMetrics.ReadPath.BY_ID); // the read is complete, found or not
+        return answer;
+    }
+
+    private Response quorumRead(String db, String schema, String id) {
         int replicas = RingRouter.replicasFor(db, schema).size();
         int required = Quorum.required(ConsistencyConfig.readConsistency(), replicas);
 
@@ -211,7 +220,12 @@ public class QuorumReadService {
                 repairs.add(() -> repairPeer(peer, winner, db, schema, id));
             }
         }
-        Broadcaster.broadcast(repairs);
+        List<Response> results = Broadcaster.broadcast(repairs);
+        if (!repairs.isEmpty()) {
+            // a repair was triggered, whether or not every replica took it
+            metrics.recordReadRepair((int) results.stream()
+                    .filter(r -> r != null && r.getResponseType() == ResponseType.SUCCESS).count());
+        }
     }
 
     private Response repairLocal(JSONObject winner, String db, String schema, String id) {
