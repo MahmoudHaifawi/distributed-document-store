@@ -9,23 +9,39 @@
 #
 # Sharding (M6): the five data nodes form a consistent-hash ring (VNODES_PER_NODE virtual nodes each,
 # default 150). Every schema is placed on REPLICATION_FACTOR of the five nodes, so with RF=3 each schema
-# lives on 3 of 5. Each node builds the ring from the cluster membership (the coordinator wires the mesh
-# from CLUSTER_NODES), so CLUSTER_NODES and REPLICATION_FACTOR are set identically on the coordinator
-# and on every node via the shared x-cluster-env block below.
+# lives on 3 of 5. Each node builds the ring from its own live membership view (see "Dynamic membership"
+# below), so CLUSTER_NODES and REPLICATION_FACTOR are set identically on the coordinator and on every
+# node via the shared x-cluster-env block below.
 #
 # Tunable consistency (M7): WRITE_CONSISTENCY / READ_CONSISTENCY (ONE | QUORUM | ALL) set how many of a
 # schema's replicas must acknowledge a schema/document write (W) and answer a read by id (R). With RF=3,
-# QUORUM is 2 of 3, so W + R = 4 > 3 gives read-your-writes for document creates and updates, a write
-# survives one replica being down, and a read repairs a replica that missed an update (last-write-wins by
-# version). Deletes are not reconciled (no tombstones yet): a replica that missed one can still return
-# the document. A node restarted with `docker compose start` must be re-wired with
-# `docker compose restart bootstrappingnode` before it serves reads as part of the cluster (see RUN.md).
-# Set identically on every node.
+# QUORUM is 2 of 3, so W + R = 4 > 3 gives read-your-writes for document creates, updates and deletes
+# (a delete writes a tombstone, M8), a write survives one replica being down, and a read repairs a
+# replica that missed a write (reconciled by vector clock). Set identically on every node.
+#
+# Dynamic membership (M9): the data nodes find each other and detect failures themselves with SWIM
+# (ping / indirect ping / suspect / dead) and spread membership changes by gossip. The ring is rebuilt on
+# every node when the live set changes, so a stopped or restarted node needs NO coordinator restart.
+#  - GOSSIP_ENABLED: "true" turns this on. Use the literal strings "true" / "false": "1" or "yes" read
+#    as false. "false" restores the old one-shot mesh wiring by the coordinator.
+#  - NODE_NAME: each node's STABLE identity, set per service below, spelled exactly as in CLUSTER_NODES.
+#    The ring is keyed by node name; without it a node announces its container-id hostname, which changes
+#    when the container is recreated, and every virtual node (and the data on disk) would move.
+#  - SEED_NODES: the contacts a starting node tries, in order, until one admits it (the first that
+#    answers wins; a node skips itself). Live data nodes first, the coordinator (a fixed SWIM seed) last.
+#    Unset, it falls back to CLUSTER_NODES.
 x-cluster-env: &cluster-env
   CLUSTER_NODES: "Node0:8080,Node1:8080,Node2:8080,Node3:8080,Node4:8080"
   REPLICATION_FACTOR: "3"
   WRITE_CONSISTENCY: "QUORUM"
   READ_CONSISTENCY: "QUORUM"
+  GOSSIP_ENABLED: "true"
+  SEED_NODES: "Node0:8080,Node1:8080,Node2:8080,Node3:8080,Node4:8080,bootstrappingnode:8079"
+  # SWIM tuning, all optional (shown with their defaults; leave SWIM_GOSSIP_MAX >= 2):
+  # SWIM_PERIOD_MS: "1000"
+  # SWIM_PING_TIMEOUT_MS: "500"
+  # SWIM_INDIRECT_K: "3"
+  # SWIM_SUSPECT_TIMEOUT_MS: "5000"
 
 services:
   Node0:
@@ -34,30 +50,35 @@ services:
     environment:
       <<: *cluster-env
       SPRING_PROFILES_ACTIVE: node
+      NODE_NAME: "Node0"
     networks: [db_cluster]
   Node1:
     image: nosql-db:latest
     environment:
       <<: *cluster-env
       SPRING_PROFILES_ACTIVE: node
+      NODE_NAME: "Node1"
     networks: [db_cluster]
   Node2:
     image: nosql-db:latest
     environment:
       <<: *cluster-env
       SPRING_PROFILES_ACTIVE: node
+      NODE_NAME: "Node2"
     networks: [db_cluster]
   Node3:
     image: nosql-db:latest
     environment:
       <<: *cluster-env
       SPRING_PROFILES_ACTIVE: node
+      NODE_NAME: "Node3"
     networks: [db_cluster]
   Node4:
     image: nosql-db:latest
     environment:
       <<: *cluster-env
       SPRING_PROFILES_ACTIVE: node
+      NODE_NAME: "Node4"
     networks: [db_cluster]
 
   bootstrappingnode:
