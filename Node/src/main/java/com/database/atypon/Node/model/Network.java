@@ -14,8 +14,9 @@ import java.util.Map;
 @Service
 public class Network {
 
-    public static List<Node> nodes;
-    public static Node self;
+    // volatile: gossip and detector threads republish these, and readers must see the latest without first reading ring
+    public static volatile List<Node> nodes;
+    public static volatile Node self;
 
     /**
      * The consistent-hash ring over every member of the cluster (peers plus this node). It is an
