@@ -99,6 +99,39 @@ services:
     depends_on: [bootstrappingnode]
     networks: [db_cluster]
 
+  # Observability (M12). Every role exposes /actuator/prometheus (public, no token); Prometheus scrapes all seven
+  # processes by service name every 10s (monitoring/prometheus.yml) and Grafana ships a provisioned dashboard on
+  # top of it.
+  #  - Prometheus  http://localhost:9090
+  #  - Grafana     http://localhost:3000   dashboard "NoSQL Cluster" opens with no login (anonymous Viewer);
+  #                to edit, sign in as admin / admin (the DEMO default below; change GF_SECURITY_ADMIN_PASSWORD
+  #                for anything shared).
+  # Neither service is needed by the database: `docker compose up Node0 ... dbms` still starts without them.
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on: [Node0, Node1, Node2, Node3, Node4, bootstrappingnode, dbms]
+    networks: [db_cluster]
+
+  grafana:
+    image: grafana/grafana:10.4.2
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: "admin"
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"
+      GF_USERS_DEFAULT_THEME: "dark"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: "/var/lib/grafana/dashboards/nosql-cluster.json"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on: [prometheus]
+    networks: [db_cluster]
+
 networks:
   db_cluster:
     driver: bridge

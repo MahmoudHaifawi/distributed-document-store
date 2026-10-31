@@ -1,0 +1,36 @@
+# M12 observability: scrape every role's Actuator Prometheus endpoint.
+#
+# Targets are compose service names on the db_cluster network (Docker DNS), each at its role's container port:
+# the five data nodes on 8080, the coordinator (bootstrappingnode) on 8079, the gateway (dbms) on 8078. The
+# endpoint is public on every role (permitAll), so no credentials are needed.
+#
+# Every meter already carries `role` and `node` tags stamped by the application (ObservabilityConfig), so this
+# file adds NO `role`/`node` target labels: Prometheus would rename the colliding scraped labels to
+# `exported_role`/`exported_node`. The job below groups targets per role; `instance` is the host:port.
+global:
+  scrape_interval: 10s
+  scrape_timeout: 5s
+  evaluation_interval: 10s
+
+scrape_configs:
+  - job_name: node
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets:
+          - Node0:8080
+          - Node1:8080
+          - Node2:8080
+          - Node3:8080
+          - Node4:8080
+
+  - job_name: coordinator
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets:
+          - bootstrappingnode:8079
+
+  - job_name: gateway
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets:
+          - dbms:8078

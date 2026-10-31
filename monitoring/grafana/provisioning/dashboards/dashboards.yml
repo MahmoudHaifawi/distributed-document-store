@@ -1,0 +1,13 @@
+# Provisioned dashboard provider: loads every *.json under /var/lib/grafana/dashboards, which docker-compose.yml
+# mounts from monitoring/grafana/dashboards. Edits made in the UI are not persisted back to the file.
+apiVersion: 1
+
+providers:
+  - name: nosql-cluster
+    orgId: 1
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
