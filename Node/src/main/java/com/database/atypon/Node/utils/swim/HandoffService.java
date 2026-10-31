@@ -1,6 +1,7 @@
 package com.database.atypon.Node.utils.swim;
 
 import com.database.atypon.Node.controllers.HandoffController;
+import com.database.atypon.Node.metrics.DbMetrics;
 import com.database.atypon.Node.model.Network;
 import com.database.atypon.Node.model.Node;
 import com.database.atypon.Node.operations.write.WriteOperation;
@@ -69,6 +70,11 @@ import java.util.regex.Pattern;
  * counter).
  *
  * <p>A single node has no peers and so nothing to pull from: the pass does nothing.
+ *
+ * <p><b>Metrics.</b> Each complete snapshot pulled from a peer counts one {@code db_handoff_pulls_total} (a pull that
+ * failed, or came back incomplete, counts nothing), and the documents of it that changed this node's copy count
+ * toward {@code db_handoff_docs_total}, so a pass that finds the data already here pulls but applies none. Both are
+ * bumped once the pull or the apply has finished, and a meter failure is swallowed rather than failing the pass.
  */
 @Component
 @Profile("node")
@@ -85,6 +91,7 @@ public class HandoffService {
     private final Supplier<String> bearer;
     private final RestTemplate rest;
     private final Executor executor;
+    private final DbMetrics metrics;
 
     /** Set while a pass is queued and has not started; a change in that time is already covered by it. */
     private final AtomicBoolean passQueued = new AtomicBoolean();
@@ -94,21 +101,27 @@ public class HandoffService {
     private final Set<String> handedOff = ConcurrentHashMap.newKeySet();
 
     @Autowired
-    public HandoffService(MembershipTable membership, WriteOperation writeOperation) {
+    public HandoffService(MembershipTable membership, WriteOperation writeOperation, DbMetrics metrics) {
         this(membership, writeOperation, ServiceTokens::bearer, TRANSFER_TIMEOUT_MS, Executors.newSingleThreadExecutor(runnable -> {
             Thread thread = new Thread(runnable, "state-handoff");
             thread.setDaemon(true);
             return thread;
-        }));
+        }), metrics);
     }
 
     /** Test seam: {@code bearer} supplies the Authorization header, and {@code executor} runs the queued passes. */
     HandoffService(MembershipTable membership, WriteOperation writeOperation, Supplier<String> bearer,
                    long transferTimeoutMs, Executor executor) {
+        this(membership, writeOperation, bearer, transferTimeoutMs, executor, DbMetrics.detached());
+    }
+
+    HandoffService(MembershipTable membership, WriteOperation writeOperation, Supplier<String> bearer,
+                   long transferTimeoutMs, Executor executor, DbMetrics metrics) {
         this.membership = membership;
         this.writeOperation = writeOperation;
         this.bearer = bearer;
         this.executor = executor;
+        this.metrics = metrics;
         SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
         factory.setConnectTimeout(CONNECT_TIMEOUT_MS);
         factory.setReadTimeout((int) Math.max(1L, Math.min(transferTimeoutMs, Integer.MAX_VALUE)));
@@ -287,6 +300,7 @@ public class HandoffService {
         for (Node source : sources) {
             JSONObject pulled = pull(source, database, schema);
             if (pulled != null) {
+                metrics.recordHandoffPull();
                 return apply(source, database, schema, pulled);
             }
         }
@@ -352,6 +366,7 @@ public class HandoffService {
                 applied++;
             }
         }
+        metrics.recordHandoffDocs(applied);
         log.info("state handoff: {}.{} from {}: {} document(s) pulled, {} changed here", database, schema,
                 source.getName(), ids.size(), applied);
         return complete;

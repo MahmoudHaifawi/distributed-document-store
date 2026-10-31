@@ -1,5 +1,6 @@
 package com.database.atypon.Node.utils.swim;
 
+import com.database.atypon.Node.metrics.DbMetrics;
 import com.database.atypon.Node.model.Network;
 import com.database.atypon.Node.model.Node;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -29,7 +30,8 @@ import java.util.function.IntUnaryOperator;
  * (never one that {@code LEFT}: it went on purpose). If it answers, the partition has healed, and the
  * exchange does the rest: the answer carries what that node believes about us, if it holds us as dead, and
  * ours what we believe about it ({@link MembershipTable#replyGossip}), each side refutes, and both rings
- * re-merge. A member that really is gone costs one unanswered ping now and then.
+ * re-merge. A member that really is gone costs one unanswered ping now and then. That ping is a direct probe like
+ * any other and is counted as one ({@code db_swim_probes_total{kind="direct"}}).
  */
 @Component
 @Profile("node")
@@ -43,15 +45,22 @@ public class SwimScheduler {
     private final SwimDetector detector;
     private final MembershipTable membership;
     private final SwimClient client;
+    private final DbMetrics metrics;
     private final Random random = new Random();
     private final AtomicInteger periods = new AtomicInteger();
     private final AtomicInteger nextDead = new AtomicInteger();
 
-    @Autowired
+    /** A scheduler whose heal-probe counts go to a private registry nobody scrapes. */
     public SwimScheduler(SwimDetector detector, MembershipTable membership, SwimClient client) {
+        this(detector, membership, client, DbMetrics.detached());
+    }
+
+    @Autowired
+    public SwimScheduler(SwimDetector detector, MembershipTable membership, SwimClient client, DbMetrics metrics) {
         this.detector = detector;
         this.membership = membership;
         this.client = client;
+        this.metrics = metrics;
     }
 
     /** One protocol period, on the real clock. Spring's scheduler never overlaps two runs of a fixed-rate task. */
@@ -84,6 +93,7 @@ public class SwimScheduler {
                 return;
             }
             Node target = dead.get(Math.floorMod(nextDead.getAndIncrement(), dead.size()));
+            metrics.recordSwimProbe(DbMetrics.ProbeKind.DIRECT);
             if (client.ping(target)) {
                 log.info("SWIM: {} is held dead but answered a probe; the cluster is re-merging", target.getName());
             }

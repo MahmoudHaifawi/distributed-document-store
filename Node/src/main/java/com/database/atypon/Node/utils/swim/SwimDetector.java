@@ -1,5 +1,6 @@
 package com.database.atypon.Node.utils.swim;
 
+import com.database.atypon.Node.metrics.DbMetrics;
 import com.database.atypon.Node.model.Network;
 import com.database.atypon.Node.model.Node;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -44,6 +45,10 @@ import java.util.function.IntUnaryOperator;
  * held, so it reaches the suspect on a later probe (or from another node); the refutation comes back as
  * the suspect's own {@code ALIVE} at the higher incarnation, which every ack carries and the client
  * merges. The ack itself clears nothing: a bare "yes" at the old incarnation loses to {@code SUSPECT}.
+ *
+ * <p>Each probe is counted as it is issued ({@code db_swim_probes_total}): {@code kind=direct} for the ping, and
+ * {@code kind=indirect} for each ping-req sent to a helper. A failure of the meter is swallowed and never reaches
+ * the probe.
  */
 @Service
 public class SwimDetector {
@@ -56,12 +61,19 @@ public class SwimDetector {
 
     private final MembershipTable membership;
     private final SwimClient client;
+    private final DbMetrics metrics;
     private final ExecutorService probePool;
 
-    @Autowired
+    /** A detector whose probe counts go to a private registry nobody scrapes. */
     public SwimDetector(MembershipTable membership, SwimClient client) {
+        this(membership, client, DbMetrics.detached());
+    }
+
+    @Autowired
+    public SwimDetector(MembershipTable membership, SwimClient client, DbMetrics metrics) {
         this.membership = membership;
         this.client = client;
+        this.metrics = metrics;
         AtomicInteger sequence = new AtomicInteger();
         this.probePool = Executors.newCachedThreadPool(task -> {
             Thread thread = new Thread(task, "swim-ping-req-" + sequence.incrementAndGet());
@@ -95,6 +107,7 @@ public class SwimDetector {
         }
 
         Node target = peers.remove(pick(rng, peers.size()));
+        metrics.recordSwimProbe(DbMetrics.ProbeKind.DIRECT);
         if (client.ping(target)) {
             return;
         }
@@ -141,6 +154,7 @@ public class SwimDetector {
         }
         CompletionService<Boolean> answers = new ExecutorCompletionService<>(probePool);
         for (Node helper : via) {
+            metrics.recordSwimProbe(DbMetrics.ProbeKind.INDIRECT);
             answers.submit(() -> client.pingReq(helper, target));
         }
         try {

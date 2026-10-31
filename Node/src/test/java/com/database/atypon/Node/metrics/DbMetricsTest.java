@@ -643,7 +643,9 @@ class DbMetricsTest {
         Set<String> names = registry.getMeters().stream().map(m -> m.getId().getName()).collect(Collectors.toSet());
         assertThat(names).containsExactlyInAnyOrder(
                 "db_write_total", "db_write_replicas", "db_read_total", "db_read_repair_total",
-                "db_read_repair_docs_total", "db_reconcile_conflicts_total", "db_tombstone_written_total");
+                "db_read_repair_docs_total", "db_reconcile_conflicts_total", "db_tombstone_written_total",
+                // the membership / SWIM / handoff counters (their gauges are bound by MembershipTable, see MembershipMetricsTest)
+                "db_swim_probes_total", "db_swim_gossip_total", "db_handoff_pulls_total", "db_handoff_docs_total");
 
         assertThat(tagValues("db_write_total")).containsExactlyInAnyOrder(
                 "origin=forwarded|result=quorum_failed|type=create", "origin=forwarded|result=quorum_failed|type=delete",
@@ -659,6 +661,10 @@ class DbMetricsTest {
         assertThat(tagValues("db_read_repair_total")).containsExactly("");
         assertThat(tagValues("db_read_repair_docs_total")).containsExactly("");
         assertThat(tagValues("db_tombstone_written_total")).containsExactly("");
+        assertThat(tagValues("db_swim_probes_total")).containsExactlyInAnyOrder("kind=direct", "kind=indirect");
+        assertThat(tagValues("db_swim_gossip_total")).containsExactlyInAnyOrder("direction=sent", "direction=received");
+        assertThat(tagValues("db_handoff_pulls_total")).containsExactly("");
+        assertThat(tagValues("db_handoff_docs_total")).containsExactly("");
 
         for (Meter meter : registry.getMeters()) {
             assertThat(meter.getId().getTags()).extracting(Tag::getKey)

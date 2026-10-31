@@ -1,7 +1,9 @@
 package com.database.atypon.Node.utils.swim;
 
+import com.database.atypon.Node.metrics.DbMetrics;
 import com.database.atypon.Node.model.Network;
 import com.database.atypon.Node.model.Node;
+import com.database.atypon.Node.utils.ring.HashRing;
 import com.database.atypon.Node.utils.swim.dto.MemberUpdate;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
@@ -46,6 +48,14 @@ import java.util.function.LongSupplier;
  *
  * <p>{@link Network#self} must be assigned (as the coordinator already does) before
  * {@link #initSelf(Node)}, otherwise the projection cannot tell this node from its peers.
+ *
+ * <p><b>Metrics.</b> The table is where membership state lives, so it is where it is measured, without adding to
+ * what any update does. At construction it binds the ring size ({@code db_ring_size}) and the per-state member
+ * counts ({@code db_swim_members}) to suppliers that read {@link Network#ring} and {@link #snapshot()} when the
+ * registry is scraped: nothing is recomputed as the table changes. The gossip counters
+ * ({@code db_swim_gossip_total}) are bumped once per message, after the lock is released, by
+ * {@link #outgoingGossip(int)} and {@link #replyGossip(int, String)} (sent) and {@link #mergeGossip(List)}
+ * (received). A metrics failure is swallowed by {@link DbMetrics#safe} and never reaches the protocol.
  */
 @Service
 public class MembershipTable {
@@ -54,6 +64,7 @@ public class MembershipTable {
 
     private final Object lock = new Object();
     private final LongSupplier clock;
+    private final DbMetrics metrics;
 
     /** Told after every change to the live set; see {@link #addChangeListener}. */
     private final List<Runnable> changeListeners = new CopyOnWriteArrayList<>();
@@ -73,14 +84,45 @@ public class MembershipTable {
     private String selfName;
     private int selfIncarnation;
 
+    /** What Spring uses: a table whose membership meters land in {@code metrics}. */
     @Autowired
+    public MembershipTable(DbMetrics metrics) {
+        this(System::currentTimeMillis, metrics);
+    }
+
+    /** A table whose membership meters go to a private registry nobody scrapes. */
     public MembershipTable() {
-        this(System::currentTimeMillis);
+        this(DbMetrics.detached());
     }
 
     /** Test seam: {@code clock} supplies the epoch-millis stamped on every record the table adopts. */
     MembershipTable(LongSupplier clock) {
+        this(clock, DbMetrics.detached());
+    }
+
+    MembershipTable(LongSupplier clock, DbMetrics metrics) {
         this.clock = clock;
+        this.metrics = metrics;
+        // Bound once, here: the registry reads the live state through these when it is scraped.
+        metrics.bindMembership(MembershipTable::ringSize, this::membersIn);
+    }
+
+    /** Physical nodes on the ring this node routes by, or zero before there is one. Lock-free: one volatile read. */
+    private static double ringSize() {
+        HashRing ring = Network.ring;
+        return ring == null ? 0 : ring.physicalNodeCount();
+    }
+
+    /** How many members are in {@code state} right now, counted from {@link #snapshot()}. */
+    private double membersIn(DbMetrics.SwimState state) {
+        MemberState wanted = MemberState.valueOf(state.name());
+        int count = 0;
+        for (Member member : snapshot()) {
+            if (member.getState() == wanted) {
+                count++;
+            }
+        }
+        return count;
     }
 
     /**
@@ -195,31 +237,38 @@ public class MembershipTable {
      * queue already holds an update about this node, that one is the slot, refreshed to the current record.
      */
     public List<MemberUpdate> outgoingGossip(int max) {
+        List<MemberUpdate> wire;
         synchronized (lock) {
-            if (max <= 0) {
-                return new ArrayList<>();
-            }
-            Member self = selfName == null ? null : members.get(selfName);
-            boolean announceSelf = self != null && self.getState() == MemberState.ALIVE;
-            List<Member> chosen = drainLocked(announceSelf ? max - 1 : max);
-            if (announceSelf) {
-                boolean queued = false;
-                for (int i = 0; i < chosen.size(); i++) {
-                    if (chosen.get(i).getNode().getName().equals(selfName)) {
-                        chosen.set(i, self);
-                        queued = true;
-                    }
-                }
-                if (!queued) {
-                    chosen.add(self);
-                }
-            }
-            List<MemberUpdate> wire = new ArrayList<>(chosen.size());
-            for (Member member : chosen) {
-                wire.add(MemberUpdate.from(member));
-            }
-            return wire;
+            wire = outgoingGossipLocked(max);
         }
+        recordSent(wire);
+        return wire;
+    }
+
+    private List<MemberUpdate> outgoingGossipLocked(int max) {
+        if (max <= 0) {
+            return new ArrayList<>();
+        }
+        Member self = selfName == null ? null : members.get(selfName);
+        boolean announceSelf = self != null && self.getState() == MemberState.ALIVE;
+        List<Member> chosen = drainLocked(announceSelf ? max - 1 : max);
+        if (announceSelf) {
+            boolean queued = false;
+            for (int i = 0; i < chosen.size(); i++) {
+                if (chosen.get(i).getNode().getName().equals(selfName)) {
+                    chosen.set(i, self);
+                    queued = true;
+                }
+            }
+            if (!queued) {
+                chosen.add(self);
+            }
+        }
+        List<MemberUpdate> wire = new ArrayList<>(chosen.size());
+        for (Member member : chosen) {
+            wire.add(MemberUpdate.from(member));
+        }
+        return wire;
     }
 
     /**
@@ -239,20 +288,34 @@ public class MembershipTable {
      * sender has no belief to correct.
      */
     public List<MemberUpdate> replyGossip(int max, String sender) {
+        List<MemberUpdate> wire;
         synchronized (lock) {
-            if (max <= 0) {
-                return new ArrayList<>();
-            }
-            Member belief = (sender == null || sender.equals(selfName)) ? null : members.get(sender);
-            boolean correct = belief != null
-                    && (belief.getState() == MemberState.DEAD || belief.getState() == MemberState.SUSPECT);
-            if (!correct) {
-                return outgoingGossip(max);
-            }
-            List<MemberUpdate> wire = max > 1 ? outgoingGossip(max - 1) : new ArrayList<>();
-            wire.removeIf(update -> sender.equals(update.getName())); // the belief below supersedes any older word of it
-            wire.add(MemberUpdate.from(belief));
-            return wire;
+            wire = replyGossipLocked(max, sender);
+        }
+        recordSent(wire);
+        return wire;
+    }
+
+    private List<MemberUpdate> replyGossipLocked(int max, String sender) {
+        if (max <= 0) {
+            return new ArrayList<>();
+        }
+        Member belief = (sender == null || sender.equals(selfName)) ? null : members.get(sender);
+        boolean correct = belief != null
+                && (belief.getState() == MemberState.DEAD || belief.getState() == MemberState.SUSPECT);
+        if (!correct) {
+            return outgoingGossipLocked(max);
+        }
+        List<MemberUpdate> wire = max > 1 ? outgoingGossipLocked(max - 1) : new ArrayList<>();
+        wire.removeIf(update -> sender.equals(update.getName())); // the belief below supersedes any older word of it
+        wire.add(MemberUpdate.from(belief));
+        return wire;
+    }
+
+    /** One message left with this gossip attached (none, if there was no gossip to attach). */
+    private void recordSent(List<MemberUpdate> gossip) {
+        if (!gossip.isEmpty()) {
+            metrics.recordSwimGossip(DbMetrics.GossipDirection.SENT);
         }
     }
 
@@ -273,6 +336,9 @@ public class MembershipTable {
                     mergeAndProjectLocked(update.toMember());
                 }
             }
+        }
+        if (!gossip.isEmpty()) {
+            metrics.recordSwimGossip(DbMetrics.GossipDirection.RECEIVED); // one message, however many updates it held
         }
         notifyChangeListeners(); // once for the whole message, after the lock is released
     }

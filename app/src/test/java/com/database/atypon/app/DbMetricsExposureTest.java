@@ -60,13 +60,35 @@ class DbMetricsExposureTest {
 
         for (String series : List.of("db_write_total", "db_read_total", "db_read_repair_total",
                 "db_read_repair_docs_total", "db_reconcile_conflicts_total", "db_tombstone_written_total",
-                "db_write_replicas_count", "db_write_replicas_sum")) {
+                "db_write_replicas_count", "db_write_replicas_sum",
+                "db_ring_size", "db_swim_members", "db_swim_probes_total", "db_swim_gossip_total",
+                "db_handoff_pulls_total", "db_handoff_docs_total")) {
             List<String> samples = lines.stream().filter(l -> l.startsWith(series + "{")).collect(Collectors.toList());
             assertFalse(samples.isEmpty(), "no " + series + " sample in the scrape");
             for (String sample : samples) {
                 assertTrue(sample.contains("role=\"node\""), "missing role tag: " + sample);
                 assertTrue(sample.contains("node=\"TestNode\""), "missing node tag: " + sample);
             }
+        }
+    }
+
+    @Test
+    void theMembershipGaugesAreReadLiveOnScrapeAndAreNumbers() throws Exception {
+        List<String> lines = scrapedLines();
+
+        List<String> samples = lines.stream()
+                .filter(l -> l.startsWith("db_ring_size{") || l.startsWith("db_swim_members{"))
+                .collect(Collectors.toList());
+        // the ring size, and one member count per state the catalogue names
+        assertTrue(samples.stream().anyMatch(l -> l.startsWith("db_ring_size{")), "no db_ring_size sample");
+        for (String state : List.of("alive", "suspect", "dead")) {
+            assertTrue(samples.stream().anyMatch(l -> l.startsWith("db_swim_members{") && l.contains("state=\"" + state + "\"")),
+                    "no db_swim_members sample for state " + state);
+        }
+        for (String sample : samples) {
+            double value = Double.parseDouble(sample.substring(sample.lastIndexOf(' ') + 1));
+            assertFalse(Double.isNaN(value), "a gauge source was lost, so it reads NaN: " + sample);
+            assertTrue(value >= 0, sample);
         }
     }
 
