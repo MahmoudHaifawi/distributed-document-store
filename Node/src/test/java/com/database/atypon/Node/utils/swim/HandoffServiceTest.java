@@ -7,6 +7,7 @@ import com.database.atypon.Node.services.index.IndexManager;
 import com.database.atypon.Node.services.read.ReadService;
 import com.database.atypon.Node.utils.ring.HashRing;
 import com.database.atypon.Node.utils.ring.RingRouter;
+import com.database.atypon.Node.utils.response.Response;
 import com.database.atypon.Node.utils.response.ResponseType;
 import com.database.atypon.Node.utils.vclock.Reconcile;
 import com.sun.net.httpserver.HttpExchange;
@@ -38,8 +39,11 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.clearInvocations;
+import static org.mockito.Mockito.doCallRealMethod;
+import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 
@@ -204,7 +208,11 @@ class HandoffServiceTest {
     }
 
     private HandoffService service() {
-        return new HandoffService(new MembershipTable(), writeOp, () -> BEARER, 2_000L, Runnable::run);
+        return service(writeOp);
+    }
+
+    private HandoffService service(WriteOperation operations) {
+        return new HandoffService(new MembershipTable(), operations, () -> BEARER, 2_000L, Runnable::run);
     }
 
     private static JSONObject definition(int nextId) {
@@ -385,6 +393,79 @@ class HandoffServiceTest {
 
         assertThat(new JSONObject(Files.readString(schemaFile)).getJSONObject("info").getInt("nextId"))
                 .as("a create here must not reuse the id of a document that was handed over").isEqualTo(5);
+    }
+
+    // ---- a pull that is not a whole snapshot is not adopted -------------------------------------
+    // A source reads its files without a lock, so a pull can catch the schema file mid-rewrite and carry no
+    // definition. Taking its documents anyway would leave this node holding data it cannot serve, marked done.
+
+    @Test
+    void aPullWithoutADefinitionIsNotAdoptedAndIsRetriedOnTheNextChange() throws Exception {
+        Peer source = peer("127.0.0.1").offer(KEY, null, docs("0", doc("ann", 31, 1, "src", 1_000)));
+        clusterOf(source);
+        HandoffService service = service();
+
+        service.onChange();
+
+        assertThat(Files.exists(records.resolve("0.json"))).as("no documents without their schema").isFalse();
+        assertThat(Files.exists(schemaFile)).isFalse();
+        assertThat(source.pulls()).hasSize(1);
+
+        source.offer(KEY, definition(1), docs("0", doc("ann", 31, 1, "src", 1_000))); // the source has finished its write
+        service.onChange();
+
+        assertThat(source.pulls()).as("it was not marked handed off, so it is pulled again").hasSize(2);
+        assertSame(stored("0"), doc("ann", 31, 1, "src", 1_000));
+        assertThat(new JSONObject(Files.readString(schemaFile)).getJSONObject("schema")
+                .similar(definition(1).getJSONObject("schema"))).isTrue();
+    }
+
+    @Test
+    void aPullWithoutADefinitionFallsBackToAnotherSource() throws Exception {
+        Peer broken = peer("127.0.0.1").offer(KEY, null, docs("0", doc("old", 1, 1, "src", 500)));
+        Peer whole = peer("127.0.0.2").offer(KEY, definition(1), docs("0", doc("ann", 31, 1, "src", 1_000)));
+        clusterOf(broken, whole);
+
+        service().onChange();
+
+        assertSame(stored("0"), doc("ann", 31, 1, "src", 1_000)); // from the source that sent a whole snapshot
+        assertThat(Files.exists(schemaFile)).isTrue();
+        assertThat(whole.pulls()).hasSize(1);
+        assertThat(broken.pulls().size()).isLessThanOrEqualTo(1);
+    }
+
+    @Test
+    void documentsAreNotAppliedToASchemaThatHasNoDefinitionHere() throws Exception {
+        WriteOperation operations = spy(writeOp);
+        // adoption claims success but leaves no definition behind
+        doReturn(new Response(ResponseType.SUCCESS, "stub", false)).when(operations).adoptSchema(any(), any(), any(), anyInt());
+        Peer source = peer("127.0.0.1").offer(KEY, definition(1), docs("0", doc("ann", 31, 1, "src", 1_000)));
+        clusterOf(source);
+        HandoffService service = service(operations);
+
+        service.onChange();
+
+        verify(operations, never()).applyReplicated(any(), any(), any(), any());
+        assertThat(Files.exists(records.resolve("0.json"))).isFalse();
+
+        doCallRealMethod().when(operations).adoptSchema(any(), any(), any(), anyInt());
+        service.onChange();
+
+        assertThat(source.pulls()).as("not marked handed off, so it is tried again").hasSize(2);
+        assertSame(stored("0"), doc("ann", 31, 1, "src", 1_000));
+    }
+
+    @Test
+    void adoptSchemaNeverCreatesADataDirectoryItHasNoDefinitionFor() throws Exception {
+        Response refused = writeOp.adoptSchema(DB, SCHEMA, null, 3);
+
+        assertThat(refused.getResponseType()).isEqualTo(ResponseType.ERROR);
+        assertThat(Files.exists(dbDir)).as("nothing is left behind").isFalse();
+
+        seedReceiver(2, docs());
+        Response held = writeOp.adoptSchema(DB, SCHEMA, null, 9); // already held: it may still move the counter forward
+        assertThat(held.getResponseType()).isEqualTo(ResponseType.SUCCESS);
+        assertThat(new JSONObject(Files.readString(schemaFile)).getJSONObject("info").getInt("nextId")).isEqualTo(9);
     }
 
     // ---- which schemas, from whom --------------------------------------------------------------

@@ -134,6 +134,50 @@ class HandoffControllerTest {
     }
 
     @Test
+    void pullOfADataDirectoryWithNoDefinitionIsNotFound() throws Exception {
+        Files.createDirectories(dbDir.resolve("ghost-records"));
+        Files.writeString(dbDir.resolve("ghost-records").resolve("0.json"), live.toString());
+
+        assertThat(get("/swim/pull?database=" + DB + "&schema=ghost", bearer("INTERNAL")).getStatusCode())
+                .isEqualTo(HttpStatus.NOT_FOUND);
+    }
+
+    // A writer truncates a file before it rewrites it, and the pull reads without a lock. The pull must then
+    // fail (so the receiver asks someone else), never answer without the file: a snapshot with a document or
+    // the definition missing looks whole to the receiver, which would adopt it.
+
+    @Test
+    void pullFailsWhileADocumentCannotBeRead() throws Exception {
+        Path inFlight = records.resolve("2.json");
+
+        Files.writeString(inFlight, ""); // truncated, not yet rewritten
+        assertThat(get("/swim/pull?database=" + DB + "&schema=items", bearer("INTERNAL")).getStatusCode())
+                .isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
+
+        Files.writeString(inFlight, "{\"Name\":\"ann\",\"_ver"); // half written
+        assertThat(get("/swim/pull?database=" + DB + "&schema=items", bearer("INTERNAL")).getStatusCode())
+                .isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
+
+        Files.writeString(inFlight, live.toString()); // the write finished: the pull works again
+        ResponseEntity<String> done = get("/swim/pull?database=" + DB + "&schema=items", bearer("INTERNAL"));
+        assertThat(done.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(new JSONObject(done.getBody()).getJSONObject("documents").keySet()).contains("2");
+    }
+
+    @Test
+    void pullFailsWhileTheDefinitionCannotBeRead() throws Exception {
+        Path definitionFile = dbDir.resolve("schemas").resolve("items.json");
+
+        Files.writeString(definitionFile, ""); // every create rewrites the schema file: this is the window
+        assertThat(get("/swim/pull?database=" + DB + "&schema=items", bearer("INTERNAL")).getStatusCode())
+                .isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
+
+        Files.writeString(definitionFile, "{\"info\":{\"schemaName\":\"it");
+        assertThat(get("/swim/pull?database=" + DB + "&schema=items", bearer("INTERNAL")).getStatusCode())
+                .isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
+    }
+
+    @Test
     void pullRefusesNamesThatWouldLeaveTheDataDirectory() {
         for (String query : List.of("database=..&schema=items", "database=" + DB + "&schema=..%2F..%2Finfo",
                 "database=%2E%2E%2F%2E%2E&schema=items", "database=&schema=items")) {

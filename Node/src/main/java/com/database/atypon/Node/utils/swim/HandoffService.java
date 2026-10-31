@@ -299,7 +299,15 @@ public class HandoffService {
                     .queryParam("database", "{database}").queryParam("schema", "{schema}")
                     .encode().buildAndExpand(database, schema).toUri();
             JSONObject pulled = new JSONObject(get(uri));
-            return pulled.optJSONObject(HandoffController.DOCUMENTS) == null ? null : pulled;
+            if (pulled.optJSONObject(HandoffController.DOCUMENTS) == null
+                    || pulled.optJSONObject(HandoffController.DEFINITION) == null) {
+                // Documents without the schema's definition are not a snapshot to adopt: this node would hold the
+                // data and still be unable to serve or replicate-create in the schema. Ask the next source instead.
+                log.warn("state handoff: the pull of {}.{} from {} is incomplete (no definition or no documents), ignoring it",
+                        database, schema, source.getName());
+                return null;
+            }
+            return pulled;
         } catch (RuntimeException e) {
             log.warn("state handoff: pulling {}.{} from {} failed: {}", database, schema, source.getName(), e.toString());
             return null;
@@ -324,6 +332,11 @@ public class HandoffService {
                 pulled.optJSONObject(HandoffController.DEFINITION), nextIdFloor);
         if (adopted.getResponseType() == ResponseType.ERROR) {
             log.warn("state handoff: cannot give {}.{} a home here: {}", database, schema, adopted.getMessage());
+            return false;
+        }
+        if (!new File(PathBuilder.getPathToSchema(database, schema)).isFile()) {
+            // Never store documents of a schema this node cannot serve: it would look handed over and not be.
+            log.warn("state handoff: {}.{} still has no definition here, not applying its documents", database, schema);
             return false;
         }
 

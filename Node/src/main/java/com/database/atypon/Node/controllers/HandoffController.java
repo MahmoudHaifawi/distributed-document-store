@@ -69,12 +69,18 @@ public class HandoffController {
     }
 
     /**
-     * One schema, whole: its definition (the schema file, {@code null} if it has none) and every document
-     * file of it as {@code {"<id>": <document>}}, each exactly as stored, a tombstone included. Not found if
-     * this node does not hold the schema's data.
+     * One schema, whole: its definition (the schema file) and every document file of it as
+     * {@code {"<id>": <document>}}, each exactly as stored, a tombstone included. Not found if this node does
+     * not hold the schema (no data directory, or no definition).
      *
-     * <p>A file that is not a document ({@code <digits>.json}), or that cannot be read as JSON, is left out
-     * rather than failing the whole handoff; the receiver would only apply what it can interpret anyway.
+     * <p>The answer is all or nothing. This reads the files without taking any write lock, and a writer
+     * truncates a file before it rewrites it (every create rewrites the schema file), so a read can land on a
+     * file that is empty or half written. Leaving that file out, or sending the definition as {@code null},
+     * would hand the receiver a snapshot that looks complete and is not: it would store the documents, decide
+     * the schema had been handed over, and never learn the definition. So if the definition, or any file named
+     * like a document ({@code <digits>.json}), cannot be read as JSON, the pull fails with 503 and the
+     * receiver tries another replica, or this one at the next change. Files not named like a document are
+     * ignored.
      */
     @GetMapping(value = "/swim/pull", produces = MediaType.APPLICATION_JSON_VALUE)
     public String pull(@RequestParam String database, @RequestParam String schema) {
@@ -86,23 +92,36 @@ public class HandoffController {
         if (files == null) {
             throw new ResponseStatusException(HttpStatus.NOT_FOUND, "this node does not hold " + database + "." + schema);
         }
+        File definitionFile = new File(PathBuilder.getPathToSchema(database, schema));
+        if (!definitionFile.isFile()) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND, "this node does not hold " + database + "." + schema);
+        }
         Arrays.sort(files, Comparator.comparing(File::getName));
 
+        JSONObject definition = readJson(definitionFile);
+        if (definition == null) {
+            throw unreadable(definitionFile);
+        }
         JSONObject documents = new JSONObject();
         for (File file : files) {
             JSONObject document = readJson(file);
-            if (document != null) {
-                String name = file.getName();
-                documents.put(name.substring(0, name.length() - JSON_SUFFIX.length()), document);
+            if (document == null) {
+                throw unreadable(file);
             }
+            String name = file.getName();
+            documents.put(name.substring(0, name.length() - JSON_SUFFIX.length()), document);
         }
-        File definition = new File(PathBuilder.getPathToSchema(database, schema));
-        JSONObject answer = new JSONObject()
+        return new JSONObject()
                 .put("database", database)
                 .put("schema", schema)
-                .put(DEFINITION, definition.isFile() ? orNull(readJson(definition)) : JSONObject.NULL)
-                .put(DOCUMENTS, documents);
-        return answer.toString();
+                .put(DEFINITION, definition)
+                .put(DOCUMENTS, documents)
+                .toString();
+    }
+
+    private static ResponseStatusException unreadable(File file) {
+        return new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE,
+                "cannot read " + file.getName() + " right now; try again");
     }
 
     /**
@@ -115,17 +134,14 @@ public class HandoffController {
                 && name.indexOf('/') < 0 && name.indexOf('\\') < 0 && name.indexOf('\0') < 0;
     }
 
-    private static Object orNull(JSONObject value) {
-        return value == null ? JSONObject.NULL : value;
-    }
-
+    /** The file as JSON, or null if it cannot be read or parsed (typically: a writer is in the middle of it). */
     private static JSONObject readJson(File file) {
         try {
             FileReader reader = new FileReader(file);
             reader.read();
             return new JSONObject(reader.getContent());
         } catch (RuntimeException e) {
-            log.warn("handoff: skipping {}, which cannot be read as JSON: {}", file.getPath(), e.toString());
+            log.warn("handoff: {} cannot be read as JSON: {}", file.getPath(), e.toString());
             return null;
         }
     }

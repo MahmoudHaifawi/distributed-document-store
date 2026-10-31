@@ -177,7 +177,9 @@ public class WriteOperation {
      * the user-facing database list.
      *
      * @return SUCCESS with {@code true} as content if the schema file was created or its counter raised,
-     *         {@code false} if nothing needed changing; ERROR if a directory or the file cannot be written
+     *         {@code false} if nothing needed changing; ERROR if a directory or the file cannot be written, or
+     *         if no definition is held and none was offered (nothing is created then): a schema is never
+     *         adopted without its definition
      */
     public Response adoptSchema(String database, String schema, JSONObject offered, int nextIdFloor) {
         synchronized (this) {
@@ -185,21 +187,21 @@ public class WriteOperation {
                 File schemaFile = new File(PathBuilder.getPathToSchema(database, schema));
                 File schemasDirectory = schemaFile.getParentFile();
                 File dataDirectory = new File(PathBuilder.getPathToAllDocuments(database, schema));
+                boolean held = schemaFile.exists();
+                if (!held && offered == null) // nothing to install: do not leave a data directory without a schema
+                    return new Response(ResponseType.ERROR, "No schema definition held or offered");
                 if (!schemasDirectory.isDirectory() && !schemasDirectory.mkdirs())
                     return new Response(ResponseType.ERROR, "Cannot create the schemas directory");
                 if (!dataDirectory.isDirectory() && !dataDirectory.mkdirs())
                     return new Response(ResponseType.ERROR, "Cannot create the schema data directory");
 
-                boolean held = schemaFile.exists();
                 JSONObject definition;
                 if (held) {
                     FileReader fileReader = new FileReader(schemaFile);
                     fileReader.read();
                     definition = new JSONObject(fileReader.getContent());
-                } else if (offered != null) {
-                    definition = new JSONObject(offered.toString());
                 } else {
-                    return new Response(ResponseType.SUCCESS, "No schema definition to adopt", false);
+                    definition = new JSONObject(offered.toString());
                 }
 
                 JSONObject info = definition.optJSONObject(JsonKeys.INFO);
