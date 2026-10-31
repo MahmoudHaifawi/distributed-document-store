@@ -13,6 +13,9 @@ COPY Node Node
 COPY BootstrappingNode BootstrappingNode
 COPY DBMS DBMS
 COPY app app
+# Not built into the image (nothing in `app` depends on it, so `-pl app -am` skips it), but the root pom
+# declares it as a module and Maven refuses to start if a declared module's directory is missing.
+COPY ycsb-binding ycsb-binding
 RUN mvn -q -B -DskipTests -pl app -am package
 
 # ---- run stage ----

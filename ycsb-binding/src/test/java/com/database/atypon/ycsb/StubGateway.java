@@ -16,6 +16,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -52,6 +53,10 @@ final class StubGateway implements AutoCloseable {
     private boolean preexisting;
     private int injectedConflicts;
     private boolean closed;
+    private final Map<String, ForcedAnswer> forced = new ConcurrentHashMap<>();
+
+    private record ForcedAnswer(int status, String body) {
+    }
 
     StubGateway() throws IOException {
         server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
@@ -88,6 +93,18 @@ final class StubGateway implements AutoCloseable {
 
     String currentToken() {
         return currentToken;
+    }
+
+    /**
+     * From now on answers {@code method path} with this raw HTTP status and body instead of routing it (for an
+     * authenticated request): a Spring 404 page, a 500, a node envelope the real endpoints would not send.
+     */
+    void forceAnswer(String method, String path, int status, String body) {
+        forced.put(method + " " + path, new ForcedAnswer(status, body));
+    }
+
+    void clearForcedAnswers() {
+        forced.clear();
     }
 
     /** The next {@code n} updates find the document already bumped by a concurrent writer. */
@@ -138,6 +155,10 @@ final class StubGateway implements AutoCloseable {
             } else if (!("Bearer " + currentToken).equals(request.authorization())) {
                 status = 403;
                 response = "{\"status\":403,\"error\":\"Forbidden\"}";
+            } else if (forced.containsKey(request.method() + " " + request.path())) {
+                ForcedAnswer answer = forced.get(request.method() + " " + request.path());
+                status = answer.status();
+                response = answer.body();
             } else {
                 response = route(request);
             }

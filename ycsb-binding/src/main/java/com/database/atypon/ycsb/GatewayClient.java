@@ -32,37 +32,52 @@ final class GatewayClient {
      * verdict, the rest the replicas'); the index query, read-by-id and login answer with one.
      */
     static final class Reply {
+        /** What the node answers for a document that is absent or deleted (read, update and delete alike). */
+        static final String DOCUMENT_NOT_FOUND = "Document not found";
+
         final String type;
         final String message;
         final Object content;
+        /**
+         * True only for an envelope the node itself produced from a 2xx answer. A transport failure, a non-2xx
+         * HTTP status (a Spring 404 page, a 500) and an unparseable body are synthesized here with this
+         * false, so their text can never be mistaken for one of the node's own answers.
+         */
+        private final boolean fromNode;
 
-        Reply(String type, String message, Object content) {
+        Reply(String type, String message, Object content, boolean fromNode) {
             this.type = type;
             this.message = message;
             this.content = content;
+            this.fromNode = fromNode;
         }
 
+        /** A failure that did not come from the node's application logic. */
         static Reply error(String message) {
-            return new Reply("ERROR", message, null);
+            return new Reply("ERROR", message, null, false);
         }
 
         boolean isSuccess() {
             return "SUCCESS".equals(type);
         }
 
-        /** The node's wording for a document that is absent or deleted is "Document not found". */
+        /**
+         * The node genuinely reporting a missing document: its own "Document not found" answer. An HTTP 404,
+         * an I/O failure ("File not found"), a 5xx or an unparseable body is not a miss, it is an error, and
+         * must be counted as one.
+         */
         boolean isNotFound() {
-            return !isSuccess() && lower().contains("not found");
+            return fromNode && !isSuccess() && DOCUMENT_NOT_FOUND.equalsIgnoreCase(message == null ? "" : message.trim());
         }
 
         /** An update or delete made against a stale {@code _version}. */
         boolean isVersionConflict() {
-            return !isSuccess() && lower().startsWith("version conflict");
+            return fromNode && !isSuccess() && lower().startsWith("version conflict");
         }
 
         /** Creating a database, schema or index that is already there. */
         boolean alreadyExists() {
-            return !isSuccess() && lower().contains("already exists");
+            return fromNode && !isSuccess() && lower().contains("already exists");
         }
 
         private String lower() {
@@ -191,7 +206,7 @@ final class GatewayClient {
                     ? new JSONArray(body).getJSONObject(0) // a write's first element is the client's verdict
                     : new JSONObject(body);
             return new Reply(envelope.optString("responseType", "ERROR"), envelope.optString("message", ""),
-                    envelope.opt("content"));
+                    envelope.opt("content"), true);
         } catch (JSONException e) {
             return Reply.error("unparseable response: " + abbreviate(body));
         }

@@ -165,6 +165,68 @@ class NoSqlDBClientTest {
         assertThat(gateway.calls("GET", "/user/read/document")).isEmpty();
     }
 
+    /** The node's own answer for an absent document: HTTP 200 with an ERROR envelope. */
+    private static final String DOCUMENT_NOT_FOUND =
+            "{\"responseType\":\"ERROR\",\"message\":\"Document not found\"}";
+
+    @Test
+    void aDocumentRemovedBetweenTheIndexAndTheFetchIsNotFound() {
+        client.insert(TABLE, "user1", values("a", "b", "c"));
+        // the index still has the id but the by-id read reports the document gone: the node's genuine miss
+        gateway.forceAnswer("GET", "/user/read/document", 200, DOCUMENT_NOT_FOUND);
+
+        assertThat(client.read(TABLE, "user1", null, new HashMap<>())).isEqualTo(Status.NOT_FOUND);
+        assertThat(client.delete(TABLE, "user1")).isEqualTo(Status.NOT_FOUND);
+        assertThat(client.update(TABLE, "user1", values("x", "y", "z"))).isEqualTo(Status.NOT_FOUND);
+        Vector<HashMap<String, ByteIterator>> rows = new Vector<>();
+        assertThat(client.scan(TABLE, "user1", 5, null, rows)).isEqualTo(Status.OK); // a vanished row is skipped
+        assertThat(rows).isEmpty();
+    }
+
+    @Test
+    void aFailureOnTheByIdStepIsAnErrorNotAMiss() {
+        client.insert(TABLE, "user1", values("a", "b", "c"));
+
+        String[][] failures = {
+                // a Spring 404 page: the URL is wrong or the route is gone, not "the document is missing"
+                {"404", "{\"timestamp\":\"t\",\"status\":404,\"error\":\"Not Found\",\"path\":\"/user/read/document\"}"},
+                {"404", "Not Found"},
+                // an I/O failure on the node
+                {"500", "{\"status\":500,\"error\":\"Internal Server Error\",\"message\":\"File not found\"}"},
+                // the node's own ERROR envelope, but not its missing-document answer
+                {"200", "{\"responseType\":\"ERROR\",\"message\":\"File not found\"}"},
+                {"200", "{\"responseType\":\"ERROR\",\"message\":\"Schema not found\"}"},
+                // not an envelope at all
+                {"200", "<html>Not Found</html>"},
+                {"200", "{\"status\":404,\"error\":\"Not Found\"}"},
+        };
+        for (String[] failure : failures) {
+            gateway.forceAnswer("GET", "/user/read/document", Integer.parseInt(failure[0]), failure[1]);
+            String answer = failure[0] + " " + failure[1];
+
+            assertThat(client.read(TABLE, "user1", null, new HashMap<>())).as("read, " + answer).isEqualTo(Status.ERROR);
+            assertThat(client.update(TABLE, "user1", values("x", "y", "z"))).as("update, " + answer).isEqualTo(Status.ERROR);
+            assertThat(client.delete(TABLE, "user1")).as("delete, " + answer).isEqualTo(Status.ERROR);
+            assertThat(client.scan(TABLE, "user1", 5, null, new Vector<>())).as("scan, " + answer).isEqualTo(Status.ERROR);
+        }
+        gateway.clearForcedAnswers();
+        assertThat(client.read(TABLE, "user1", null, new HashMap<>())).isEqualTo(Status.OK); // nothing was lost
+    }
+
+    @Test
+    void aWriteRejectedWithAnHttpErrorIsAnErrorNotAMiss() {
+        client.insert(TABLE, "user1", values("a", "b", "c"));
+
+        gateway.forceAnswer("POST", "/write/document/update", 404, "{\"status\":404,\"error\":\"Not Found\"}");
+        assertThat(client.update(TABLE, "user1", values("x", "y", "z"))).isEqualTo(Status.ERROR);
+
+        gateway.forceAnswer("POST", "/write/document/delete", 404, "{\"status\":404,\"error\":\"Not Found\"}");
+        assertThat(client.delete(TABLE, "user1")).isEqualTo(Status.ERROR);
+
+        gateway.forceAnswer("POST", "/user/index/query", 404, "{\"status\":404,\"error\":\"Not Found\"}");
+        assertThat(client.read(TABLE, "user1", null, new HashMap<>())).isEqualTo(Status.ERROR);
+    }
+
     @Test
     void keyMapsToExactlyOneDocument() {
         client.insert(TABLE, "user1", values("a", "b", "c"));
