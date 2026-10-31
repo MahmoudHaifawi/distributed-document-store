@@ -1,7 +1,11 @@
 package com.database.atypon.Node.controllers;
 
 import com.database.atypon.Node.security.JwtService;
+import com.database.atypon.Node.utils.swim.Member;
+import com.database.atypon.Node.utils.swim.MemberState;
+import com.database.atypon.Node.utils.swim.MembershipTable;
 import com.sun.net.httpserver.HttpServer;
+import org.json.JSONArray;
 import org.json.JSONObject;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -46,6 +50,8 @@ class SwimControllerTest {
     TestRestTemplate rest;
     @Autowired
     JwtService jwt;
+    @Autowired
+    MembershipTable membership;
 
     private HttpServer targetServer;
     private final AtomicInteger targetStatus = new AtomicInteger(200);
@@ -144,5 +150,38 @@ class SwimControllerTest {
     void pingReqWithoutATargetIsABadRequest() {
         assertThat(post("/swim/ping-req", bearer("INTERNAL"), "{\"from\":\"NodeX\"}").getStatusCode())
                 .isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
+    @Test
+    void gossipOnAPingIsMergedAndTheAckCarriesGossipBack() {
+        // A tombstone for a member nobody has: it enters the shared table but not the live set, so the
+        // ring other tests rely on is untouched.
+        String ping = "{\"from\":\"NodeX\",\"gossip\":[{\"name\":\"gossip-ghost\",\"port\":\"9\",\"state\":\"DEAD\",\"incarnation\":5}]}";
+
+        ResponseEntity<String> response = post("/swim/ping", bearer("INTERNAL"), ping);
+
+        assertThat(acked(response)).isTrue();
+        Member ghost = membership.get("gossip-ghost");
+        assertThat(ghost.getState()).isEqualTo(MemberState.DEAD);
+        assertThat(ghost.getIncarnation()).isEqualTo(5);
+        // it changed this node's table, so this node passes it on - in this very answer
+        JSONArray gossip = new JSONObject(response.getBody()).getJSONArray("gossip");
+        boolean found = false;
+        for (int i = 0; i < gossip.length(); i++) {
+            JSONObject update = gossip.getJSONObject(i);
+            if (update.getString("name").equals("gossip-ghost")) {
+                found = true;
+                assertThat(update.getString("state")).isEqualTo("DEAD");
+                assertThat(update.getInt("incarnation")).isEqualTo(5);
+            }
+        }
+        assertThat(found).as("the ack carries the update it just learnt: %s", gossip).isTrue();
+    }
+
+    @Test
+    void gossipWithAnUnknownStateIsABadRequest() {
+        String ping = "{\"from\":\"NodeX\",\"gossip\":[{\"name\":\"g\",\"port\":\"9\",\"state\":\"BOGUS\",\"incarnation\":1}]}";
+
+        assertThat(post("/swim/ping", bearer("INTERNAL"), ping).getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
     }
 }

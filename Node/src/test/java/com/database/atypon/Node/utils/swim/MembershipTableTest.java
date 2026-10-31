@@ -186,9 +186,11 @@ class MembershipTableTest {
         table.enqueue(m("Node2", MemberState.ALIVE, 0));
         table.enqueue(m("Node3", MemberState.ALIVE, 0));
 
+        // Updates stay queued for several sends each (retransmit counters, see GossipTest), so what a
+        // drain returns is capped by max, not by how many are left.
         assertThat(table.drainGossip(2)).hasSize(2);
-        assertThat(table.drainGossip(2)).hasSize(1);
-        assertThat(table.drainGossip(2)).isEmpty();
+        assertThat(table.drainGossip(2)).hasSize(2);
+        assertThat(table.drainGossip(10)).hasSize(3);
     }
 
     // ---- live set -----------------------------------------------------------------------------

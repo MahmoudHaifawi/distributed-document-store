@@ -133,7 +133,7 @@ class SwimDetectorTest {
     private void buildDetector() {
         table = new MembershipTable(new AtomicLong(1_000L)::get);
         table.initSelf(new Node(SELF, "8080"));
-        SwimClient client = new SwimClient(PING_TIMEOUT_MS, () -> BEARER);
+        SwimClient client = new SwimClient(table, PING_TIMEOUT_MS, () -> BEARER);
         detector = new SwimDetector(table, client);
     }
 

@@ -40,8 +40,10 @@ import java.util.function.IntUnaryOperator;
  * scheduler that drives the real protocol, decides both. The detector owns no timer.
  *
  * <p>A suspect is only ever <em>declared dead</em> here. Clearing a suspicion is the suspect's own
- * business: it refutes by raising its incarnation, which reaches this node as gossip, not as a
- * successful ping.
+ * business: it refutes by raising its incarnation. The suspicion is queued for gossip the moment it is
+ * held, so it reaches the suspect on a later probe (or from another node); the refutation comes back as
+ * the suspect's own {@code ALIVE} at the higher incarnation, which every ack carries and the client
+ * merges. The ack itself clears nothing: a bare "yes" at the old incarnation loses to {@code SUSPECT}.
  */
 @Service
 public class SwimDetector {

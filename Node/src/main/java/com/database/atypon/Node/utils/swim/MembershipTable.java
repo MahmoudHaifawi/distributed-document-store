@@ -2,12 +2,13 @@ package com.database.atypon.Node.utils.swim;
 
 import com.database.atypon.Node.model.Network;
 import com.database.atypon.Node.model.Node;
+import com.database.atypon.Node.utils.swim.dto.MemberUpdate;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashSet;
-import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -26,6 +27,12 @@ import java.util.function.LongSupplier;
  * own incarnation, which is how a wrongly suspected node clears its name: told it is suspect or dead
  * at incarnation {@code i}, it re-enters as {@code ALIVE} at {@code i + 1}, which dominates.
  *
+ * <p>Every update that changes the table is also queued for gossip, from inside the same lock that
+ * applied it (see {@link #merge(Member)}). Each queued update carries a retransmit counter,
+ * {@code ceil(lambda * log2(N + 1))} for {@code N} live members, and {@link #outgoingGossip(int)} hands out
+ * the updates with the most sends left, a few per probe, until each has been sent that many times:
+ * infection-style dissemination that reaches everyone in O(log N) periods without any broadcast.
+ *
  * <p>All state is guarded by one lock, and the ring projection is published from inside it, so
  * concurrent updates cannot reorder their effects on {@link Network}. {@link Network} never calls
  * back into this class, so the lock order is always table then network.
@@ -43,10 +50,10 @@ public class MembershipTable {
     private final Map<String, Member> members = new LinkedHashMap<>();
 
     /**
-     * Updates waiting to be piggybacked on outgoing messages, keyed by node name (the newest wins).
-     * This is only the store; retransmit counting is layered on by the gossip task.
+     * Updates waiting to be piggybacked on outgoing messages, keyed by node name, oldest first. At most
+     * one per node: a stronger claim replaces the queued one and a weaker or equal one is ignored.
      */
-    private final Map<String, Member> pendingGossip = new LinkedHashMap<>();
+    private final Map<String, Pending> pendingGossip = new LinkedHashMap<>();
 
     private String selfName;
     private int selfIncarnation;
@@ -89,6 +96,11 @@ public class MembershipTable {
      * The adopted record is stamped with the local clock rather than the sender's timestamp: it records
      * when <em>this</em> node came to believe it, which is what the suspicion window is measured from.
      * If the live set changes, the new ring is published to {@link Network}.
+     *
+     * <p>A change is also queued for gossip, here, in the same critical section that stored it. A caller
+     * that merged and then enqueued as two steps could be overtaken between them by another thread's
+     * stronger update, and the queue would end up holding the weaker one; doing it once, under the lock,
+     * means the queue can never disagree with the table about which claim is the latest.
      */
     public boolean merge(Member update) {
         synchronized (lock) {
@@ -122,23 +134,87 @@ public class MembershipTable {
         }
     }
 
-    /** Queues an update to be piggybacked on outgoing messages; a newer one for the same node replaces it. */
+    /**
+     * Queues an update to be piggybacked on outgoing messages, with a fresh budget of {@code
+     * ceil(lambda * log2(N + 1))} sends for {@code N} live members. {@link #merge(Member)} already does
+     * this for everything it changes, so this is for updates that did not come through the merge rule.
+     *
+     * <p>An update for a node that already has one queued replaces it only if it supersedes it by the
+     * merge rule (higher incarnation, or equal incarnation and a worse state). A weaker or repeated
+     * update is dropped, so a stale write can never push a {@code DEAD} out of the queue.
+     */
     public void enqueue(Member update) {
         synchronized (lock) {
             enqueueLocked(update);
         }
     }
 
-    /** Removes and returns up to {@code max} queued updates, oldest first. */
+    /**
+     * Hands out up to {@code max} queued updates, the ones with the most sends left first (the older
+     * update wins a tie), and spends one send of each. An update whose sends run out leaves the queue.
+     * A {@code max} of zero or less returns nothing and spends nothing.
+     */
     public List<Member> drainGossip(int max) {
         synchronized (lock) {
-            List<Member> drained = new ArrayList<>();
-            Iterator<Member> pending = pendingGossip.values().iterator();
-            while (drained.size() < max && pending.hasNext()) {
-                drained.add(pending.next());
-                pending.remove();
+            return drainLocked(max);
+        }
+    }
+
+    /**
+     * The gossip for one outgoing probe or ack, at most {@code max} updates in all: the queued updates
+     * with the most sends left, and this node's own {@code ALIVE} at its current incarnation.
+     *
+     * <p>The own {@code ALIVE} goes out on every message, whatever is queued. It is how a peer that
+     * suspected this node hears it is up: told this node is {@code SUSPECT} at incarnation {@code i},
+     * this node answers {@code ALIVE} at {@code i + 1}, and the merge rule lets that clear the suspicion.
+     * It takes one of the {@code max} slots (so with {@code max == 1} nothing else is sent), and if the
+     * queue already holds an update about this node, that one is the slot, refreshed to the current record.
+     */
+    public List<MemberUpdate> outgoingGossip(int max) {
+        synchronized (lock) {
+            if (max <= 0) {
+                return new ArrayList<>();
             }
-            return drained;
+            Member self = selfName == null ? null : members.get(selfName);
+            boolean announceSelf = self != null && self.getState() == MemberState.ALIVE;
+            List<Member> chosen = drainLocked(announceSelf ? max - 1 : max);
+            if (announceSelf) {
+                boolean queued = false;
+                for (int i = 0; i < chosen.size(); i++) {
+                    if (chosen.get(i).getNode().getName().equals(selfName)) {
+                        chosen.set(i, self);
+                        queued = true;
+                    }
+                }
+                if (!queued) {
+                    chosen.add(self);
+                }
+            }
+            List<MemberUpdate> wire = new ArrayList<>(chosen.size());
+            for (Member member : chosen) {
+                wire.add(MemberUpdate.from(member));
+            }
+            return wire;
+        }
+    }
+
+    /**
+     * Applies the gossip of one inbound message, update by update, through {@link #merge(Member)}; every
+     * update that changed this table is thereby queued to be passed on, and one that changed nothing is
+     * not, which is what stops gossip from circulating forever. The whole message is applied as one
+     * step, so no outgoing message can carry half of it. {@code null} gossip, and entries that are
+     * {@code null} or not {@linkplain MemberUpdate#wellFormed() well formed}, are skipped.
+     */
+    public void mergeGossip(List<MemberUpdate> gossip) {
+        if (gossip == null) {
+            return;
+        }
+        synchronized (lock) {
+            for (MemberUpdate update : gossip) {
+                if (update != null && update.wellFormed()) {
+                    merge(update.toMember());
+                }
+            }
         }
     }
 
@@ -148,7 +224,8 @@ public class MembershipTable {
     }
 
     /**
-     * Moves an {@code ALIVE} member to {@code SUSPECT} at its current incarnation, stamping {@code now}
+     * Moves an {@code ALIVE} member to {@code SUSPECT} at its current incarnation (and queues that for
+     * gossip, so the suspect itself gets to hear of it and refute), stamping {@code now}
      * as the start of its suspicion window. The stamp matters: {@link #promoteExpiredSuspectsToDead}
      * measures the window from it, so keeping the stamp from when the member was last ALIVE would let a
      * long-healthy node be declared dead on the first sweep, with no time to refute. Anything that is
@@ -173,7 +250,8 @@ public class MembershipTable {
     /**
      * Declares {@code DEAD}, at their current incarnation, every suspect whose window has run its course:
      * {@code now - lastChange >= suspectTimeoutMs}, with {@code lastChange} the moment it was suspected.
-     * A suspect that refuted in time is {@code ALIVE} again by now and is not touched.
+     * A suspect that refuted in time is {@code ALIVE} again by now and is not touched. Each death is
+     * queued for gossip.
      */
     public void promoteExpiredSuspectsToDead(long now) {
         synchronized (lock) {
@@ -192,15 +270,16 @@ public class MembershipTable {
         }
     }
 
+    /**
+     * Applies the merge rule and, if the table changed, queues what it now holds for gossip. Every
+     * local change goes through here ({@link #merge}, {@link #markSuspect}, {@link #promoteExpiredSuspectsToDead}),
+     * so every one of them is gossiped, under the lock that applied it.
+     */
     private boolean mergeLocked(Member update, long now) {
         String name = update.getNode().getName();
         Member existing = members.get(name);
 
-        boolean supersedes = existing == null
-                || update.getIncarnation() > existing.getIncarnation()
-                || (update.getIncarnation() == existing.getIncarnation()
-                && update.getState().precedence() > existing.getState().precedence());
-        if (!supersedes) {
+        if (existing != null && !supersedes(update, existing)) {
             return false;
         }
 
@@ -214,17 +293,63 @@ public class MembershipTable {
             selfIncarnation = Math.max(selfIncarnation, record.getIncarnation());
             if (record.getState() != MemberState.ALIVE) {
                 selfIncarnation++;
-                Member refutation = new Member(node, MemberState.ALIVE, selfIncarnation, now);
-                members.put(name, refutation);
-                // Only this table knows the refutation exists, so only it can queue it for the cluster.
-                enqueueLocked(refutation);
+                // What gets gossiped is the refutation, not the claim it refutes.
+                record = new Member(node, MemberState.ALIVE, selfIncarnation, now);
+                members.put(name, record);
             }
         }
+        enqueueLocked(record);
         return true;
     }
 
+    /** The merge rule: a higher incarnation wins, and at an equal one the worse state does. */
+    private static boolean supersedes(Member update, Member existing) {
+        return update.getIncarnation() > existing.getIncarnation()
+                || (update.getIncarnation() == existing.getIncarnation()
+                && update.getState().precedence() > existing.getState().precedence());
+    }
+
     private void enqueueLocked(Member update) {
-        pendingGossip.put(update.getNode().getName(), update);
+        String name = update.getNode().getName();
+        Pending queued = pendingGossip.get(name);
+        if (queued != null && !supersedes(update, queued.update)) {
+            return;
+        }
+        pendingGossip.remove(name); // re-added at the end: a replacement is the youngest entry
+        pendingGossip.put(name, new Pending(update, retransmitBudgetLocked()));
+    }
+
+    private List<Member> drainLocked(int max) {
+        List<Member> drained = new ArrayList<>();
+        if (max <= 0 || pendingGossip.isEmpty()) {
+            return drained;
+        }
+        // The sort is stable and the queue is oldest first, so equal counters go to the older update.
+        List<Pending> ranked = new ArrayList<>(pendingGossip.values());
+        ranked.sort(Comparator.comparingInt((Pending queued) -> queued.remaining).reversed());
+        for (Pending queued : ranked.subList(0, Math.min(max, ranked.size()))) {
+            drained.add(queued.update);
+            if (--queued.remaining <= 0) {
+                pendingGossip.remove(queued.update.getNode().getName());
+            }
+        }
+        return drained;
+    }
+
+    /**
+     * {@code ceil(lambda * log2(N + 1))} sends for {@code N} live members as of now, never fewer than
+     * one. The small epsilon keeps floating-point noise in the logarithm (3.0000000000000004 for an
+     * exact 3) from tipping the ceiling to the next whole number.
+     */
+    private int retransmitBudgetLocked() {
+        int live = 0;
+        for (Member member : members.values()) {
+            if (member.getState().isLive()) {
+                live++;
+            }
+        }
+        double log2 = Math.log(live + 1.0) / Math.log(2.0);
+        return Math.max(1, (int) Math.ceil(SwimConfig.gossipLambda() * log2 - 1e-9));
     }
 
     private List<Node> liveNodesLocked() {
@@ -251,6 +376,17 @@ public class MembershipTable {
     private void projectIfLiveSetChanged(Set<String> liveBefore) {
         if (!liveBefore.equals(liveKeys())) {
             Network.setLiveMembers(liveNodesLocked());
+        }
+    }
+
+    /** A queued update and the number of sends it has left; only ever touched under {@link #lock}. */
+    private static final class Pending {
+        final Member update;
+        int remaining;
+
+        Pending(Member update, int remaining) {
+            this.update = update;
+            this.remaining = remaining;
         }
     }
 }
